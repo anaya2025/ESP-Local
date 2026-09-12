@@ -44,6 +44,8 @@ private:
     WiFiServer _rtspServer;
     WiFiClient _rtspClient;
     WiFiUDP _rtpUdp;
+    WiFiUDP _rtpControlUdp;
+    WiFiUDP _rtpTimingUdp;
 
     bool _clientConnected;
     String _clientName;

@@ -1319,8 +1319,8 @@ void setup() {
                 stopAudioPlayback();
             }
             isPlaying = true;
-            currentCodec = "AirPlay 2 (PCM)";
-            currentTrack = "AirPlay 2: " + airplay.getClientName();
+            currentCodec = "AirPlay (PCM)";
+            currentTrack = "AirPlay: " + airplay.getClientName();
         } else {
             isPlaying = false;
             currentCodec = "None";
