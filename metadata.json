@@ -1,0 +1,6 @@
+{
+  "name": "ESP32-S3 N16R8 GitHub Project Studio",
+  "description": "ESP32-S3 N16R8 firmware builder with Material 3 web control, AirPlay & DLNA/UPnP HiFi receiver, live internet clock, 3-band EQ tone presets, seamless wireless OTA, and automated GitHub CI/CD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
