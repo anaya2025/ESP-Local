@@ -195,7 +195,7 @@ void DLNARenderer::_handleSsdpSearch() {
             buf[len] = '\\0';
             String req(buf);
             if (req.startsWith("M-SEARCH")) {
-                if (req.indexOf("ssdp:all") > 0 || req.indexOf("MediaRenderer") > 0 || req.indexOf("AVTransport") > 0) {
+                auto sendResp = [&](const String& st, const String& usn) {
                     IPAddress ip = WiFi.localIP();
                     String location = "http://" + ip.toString() + ":" + String(_port) + "/description.xml";
                     String response = "HTTP/1.1 200 OK\\r\\n"
@@ -204,11 +204,27 @@ void DLNARenderer::_handleSsdpSearch() {
                                       "EXT:\\r\\n"
                                       "LOCATION: " + location + "\\r\\n"
                                       "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50\\r\\n"
-                                      "ST: urn:schemas-upnp-org:device:MediaRenderer:1\\r\\n"
-                                      "USN: uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1\\r\\n\\r\\n";
+                                      "ST: " + st + "\\r\\n"
+                                      "USN: " + usn + "\\r\\n\\r\\n";
                     _ssdpUdp.beginPacket(_ssdpUdp.remoteIP(), _ssdpUdp.remotePort());
                     _ssdpUdp.write((const uint8_t*)response.c_str(), response.length());
                     _ssdpUdp.endPacket();
+                };
+
+                if (req.indexOf("ssdp:all") > 0) {
+                    sendResp("upnp:rootdevice", "uuid:" + _uuid + "::upnp:rootdevice");
+                    sendResp("uuid:" + _uuid, "uuid:" + _uuid);
+                    sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
+                } else if (req.indexOf("upnp:rootdevice") > 0) {
+                    sendResp("upnp:rootdevice", "uuid:" + _uuid + "::upnp:rootdevice");
+                } else if (req.indexOf("MediaRenderer") > 0) {
+                    sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
+                } else if (req.indexOf("AVTransport") > 0) {
+                    sendResp("urn:schemas-upnp-org:service:AVTransport:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:AVTransport:1");
+                } else if (req.indexOf("RenderingControl") > 0) {
+                    sendResp("urn:schemas-upnp-org:service:RenderingControl:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:RenderingControl:1");
+                } else if (req.indexOf("ConnectionManager") > 0) {
+                    sendResp("urn:schemas-upnp-org:service:ConnectionManager:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:ConnectionManager:1");
                 }
             }
         }
@@ -217,7 +233,9 @@ void DLNARenderer::_handleSsdpSearch() {
 
 void DLNARenderer::_registerHttpEndpoints() {
     _server->on("/description.xml", HTTP_GET, [this]() {
-        _server->send(200, "text/xml", _getDeviceDescriptionXML());
+        _server->sendHeader("Connection", "close");
+        _server->sendHeader("Access-Control-Allow-Origin", "*");
+        _server->send(200, "text/xml; charset=\\"utf-8\\"", _getDeviceDescriptionXML());
     });
 
     _server->on("/AVTransport/control", HTTP_POST, [this]() {
@@ -239,7 +257,9 @@ void DLNARenderer::_registerHttpEndpoints() {
         String soapResp = "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\">"
                           "<s:Body><u:Response xmlns:u=\\"urn:schemas-upnp-org:service:AVTransport:1\\"/>"
                           "</s:Body></s:Envelope>";
-        _server->send(200, "text/xml", soapResp);
+        _server->sendHeader("Connection", "close");
+        _server->sendHeader("Access-Control-Allow-Origin", "*");
+        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
     });
 
     _server->on("/RenderingControl/control", HTTP_POST, [this]() {
@@ -255,7 +275,24 @@ void DLNARenderer::_registerHttpEndpoints() {
         String soapResp = "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\">"
                           "<s:Body><u:Response xmlns:u=\\"urn:schemas-upnp-org:service:RenderingControl:1\\"/>"
                           "</s:Body></s:Envelope>";
-        _server->send(200, "text/xml", soapResp);
+        _server->sendHeader("Connection", "close");
+        _server->sendHeader("Access-Control-Allow-Origin", "*");
+        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
+    });
+
+    _server->on("/ConnectionManager/control", HTTP_POST, [this]() {
+        String soapResp = "<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?>\\r\\n"
+                          "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\" s:encodingStyle=\\"http://schemas.xmlsoap.org/soap/encoding/\\">\\r\\n"
+                          "  <s:Body>\\r\\n"
+                          "    <u:GetProtocolInfoResponse xmlns:u=\\"urn:schemas-upnp-org:service:ConnectionManager:1\\">\\r\\n"
+                          "      <Source></Source>\\r\\n"
+                          "      <Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>\\r\\n"
+                          "    </u:GetProtocolInfoResponse>\\r\\n"
+                          "  </s:Body>\\r\\n"
+                          "</s:Envelope>\\r\\n";
+        _server->sendHeader("Connection", "close");
+        _server->sendHeader("Access-Control-Allow-Origin", "*");
+        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
     });
 }
 
@@ -280,6 +317,11 @@ String DLNARenderer::_getDeviceDescriptionXML() {
                  "        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>\\n"
                  "        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>\\n"
                  "        <controlURL>/RenderingControl/control</controlURL>\\n"
+                 "      </service>\\n"
+                 "      <service>\\n"
+                 "        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>\\n"
+                 "        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>\\n"
+                 "        <controlURL>/ConnectionManager/control</controlURL>\\n"
                  "      </service>\\n"
                  "    </serviceList>\\n"
                  "  </device>\\n"

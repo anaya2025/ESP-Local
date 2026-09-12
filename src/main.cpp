@@ -117,6 +117,13 @@ const char UPNP_DESC_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
         <controlURL>/upnp/control/RenderingControl</controlURL>
         <eventSubURL>/upnp/event/RenderingControl</eventSubURL>
       </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+        <SCPDURL>/upnp/ConnectionManager.xml</SCPDURL>
+        <controlURL>/upnp/control/ConnectionManager</controlURL>
+        <eventSubURL>/upnp/event/ConnectionManager</eventSubURL>
+      </service>
     </serviceList>
   </device>
 </root>
@@ -132,6 +139,34 @@ const char AVTRANSPORT_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
     <action><name>Pause</name></action>
     <action><name>Stop</name></action>
     <action><name>GetTransportInfo</name></action>
+    <action><name>GetPositionInfo</name></action>
+    <action><name>GetMediaInfo</name></action>
+    <action><name>GetDeviceCapabilities</name></action>
+  </actionList>
+</scpd>
+)rawxml";
+
+// UPnP RenderingControl Service XML definition
+const char RENDERING_CONTROL_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action><name>SetVolume</name></action>
+    <action><name>GetVolume</name></action>
+    <action><name>SetMute</name></action>
+    <action><name>GetMute</name></action>
+  </actionList>
+</scpd>
+)rawxml";
+
+// UPnP ConnectionManager Service XML definition
+const char CONNECTION_MANAGER_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action><name>GetProtocolInfo</name></action>
+    <action><name>GetCurrentConnectionIDs</name></action>
+    <action><name>GetCurrentConnectionInfo</name></action>
   </actionList>
 </scpd>
 )rawxml";
@@ -889,21 +924,36 @@ void startAudioStream(const String &url, const String &trackName) {
 // SSDP Periodic NOTIFY broadcast
 void broadcastSSDPNotify() {
     IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+    if (ip == IPAddress(0, 0, 0, 0)) return;
     String ipStr = ip.toString();
-    
-    String notifyMsg = 
-      "NOTIFY * HTTP/1.1\r\n"
-      "HOST: 239.255.255.250:1900\r\n"
-      "CACHE-CONTROL: max-age=1800\r\n"
-      "LOCATION: http://" + ipStr + ":80/upnp/desc.xml\r\n"
-      "NT: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"
-      "NTS: ssdp:alive\r\n"
-      "SERVER: ESP32-S3/1.0 UPnP/1.0 Open-Air/1.0\r\n"
-      "USN: uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
 
-    ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
-    ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
-    ssdpUdp.endPacket();
+    const char* targets[] = {
+        "upnp:rootdevice",
+        "uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01",
+        "urn:schemas-upnp-org:device:MediaRenderer:1",
+        "urn:schemas-upnp-org:service:AVTransport:1",
+        "urn:schemas-upnp-org:service:RenderingControl:1",
+        "urn:schemas-upnp-org:service:ConnectionManager:1"
+    };
+
+    for (int i = 0; i < 6; i++) {
+        String target = targets[i];
+        String usn = target.startsWith("uuid:") ? target : ("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01::" + target);
+        String notifyMsg = 
+          "NOTIFY * HTTP/1.1\r\n"
+          "HOST: 239.255.255.250:1900\r\n"
+          "CACHE-CONTROL: max-age=1800\r\n"
+          "LOCATION: http://" + ipStr + ":80/upnp/desc.xml\r\n"
+          "NT: " + target + "\r\n"
+          "NTS: ssdp:alive\r\n"
+          "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
+          "USN: " + usn + "\r\n\r\n";
+
+        ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
+        ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
+        ssdpUdp.endPacket();
+        delay(2);
+    }
 }
 
 // SSDP M-SEARCH response
@@ -916,20 +966,41 @@ void handleSSDP() {
             buf[len] = '\0';
             String req(buf);
             if (req.indexOf("M-SEARCH") >= 0) {
-                if (req.indexOf("ssdp:all") >= 0 || req.indexOf("MediaRenderer") >= 0 || req.indexOf("AVTransport") >= 0) {
-                    IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
-                    String ipStr = ip.toString();
+                IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+                String ipStr = ip.toString();
+
+                auto sendResponse = [&](const String& target) {
+                    String usn = target.startsWith("uuid:") ? target : ("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01::" + target);
                     String response = 
                         "HTTP/1.1 200 OK\r\n"
                         "CACHE-CONTROL: max-age=1800\r\n"
+                        "DATE: Sun, 01 Jan 2026 00:00:00 GMT\r\n"
                         "EXT:\r\n"
                         "LOCATION: http://" + ipStr + ":80/upnp/desc.xml\r\n"
-                        "SERVER: ESP32-S3/1.0 UPnP/1.0 Open-Air/1.0\r\n"
-                        "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n"
-                        "USN: uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01::urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+                        "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
+                        "ST: " + target + "\r\n"
+                        "USN: " + usn + "\r\n\r\n";
                     ssdpUdp.beginPacket(ssdpUdp.remoteIP(), ssdpUdp.remotePort());
                     ssdpUdp.write((const uint8_t*)response.c_str(), response.length());
                     ssdpUdp.endPacket();
+                };
+
+                if (req.indexOf("ssdp:all") >= 0) {
+                    sendResponse("upnp:rootdevice");
+                    sendResponse("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01");
+                    sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
+                } else if (req.indexOf("upnp:rootdevice") >= 0) {
+                    sendResponse("upnp:rootdevice");
+                } else if (req.indexOf("MediaRenderer") >= 0) {
+                    sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
+                } else if (req.indexOf("AVTransport") >= 0) {
+                    sendResponse("urn:schemas-upnp-org:service:AVTransport:1");
+                } else if (req.indexOf("RenderingControl") >= 0) {
+                    sendResponse("urn:schemas-upnp-org:service:RenderingControl:1");
+                } else if (req.indexOf("ConnectionManager") >= 0) {
+                    sendResponse("urn:schemas-upnp-org:service:ConnectionManager:1");
+                } else if (req.indexOf("2b7405e0-8a4e-4e4b-91d1-esp32s3audio01") >= 0) {
+                    sendResponse("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01");
                 }
             }
         }
@@ -990,6 +1061,11 @@ void setup() {
                 Serial.printf("[WIFI] Signal RSSI: %d dBm\n", WiFi.RSSI());
                 Serial.println("[mDNS] Web player accessible at: http://esp32-audio.local");
                 Serial.println("========================================================\n");
+                // Re-bind SSDP multicast on station interface so multicast packets route onto the LAN
+                ssdpUdp.stop();
+                if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
+                    Serial.println("[SSDP] Multicast re-bound on STA interface 239.255.255.250:1900");
+                }
                 broadcastSSDPNotify();
                 break;
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -1036,15 +1112,38 @@ void setup() {
     });
 
     server.on("/upnp/desc.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send_P(200, "text/xml", UPNP_DESC_XML);
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    });
+
+    server.on("/description.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
     });
 
     server.on("/upnp/AVTransport.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send_P(200, "text/xml", AVTRANSPORT_XML);
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)AVTRANSPORT_XML, strlen_P(AVTRANSPORT_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
     });
 
     server.on("/upnp/RenderingControl.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(200, "text/xml", R"rawxml(<scpd xmlns="urn:schemas-upnp-org:service-1-0"><specVersion><major>1</major><minor>0</minor></specVersion></scpd>)rawxml");
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)RENDERING_CONTROL_XML, strlen_P(RENDERING_CONTROL_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    });
+
+    server.on("/upnp/ConnectionManager.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)CONNECTION_MANAGER_XML, strlen_P(CONNECTION_MANAGER_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
     });
 
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1198,11 +1297,33 @@ void setup() {
         }
     });
 
+    // UPnP SOAP OPTIONS Pre-flight Handlers
+    auto sendOptionsResponse = [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "OK");
+        response->addHeader("Allow", "GET, POST, OPTIONS");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        response->addHeader("Access-Control-Allow-Headers", "Content-Type, SOAPACTION");
+        response->addHeader("Connection", "close");
+        request->send(response);
+    };
+    server.on("/upnp/control/AVTransport", HTTP_OPTIONS, sendOptionsResponse);
+    server.on("/upnp/control/RenderingControl", HTTP_OPTIONS, sendOptionsResponse);
+    server.on("/upnp/control/ConnectionManager", HTTP_OPTIONS, sendOptionsResponse);
+
     // UPnP SOAP AVTransport Control
     server.on("/upnp/control/AVTransport", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index + len >= total) {
-            String body = String((char*)data);
+            String body = "";
+            if (data && len > 0) {
+                char* tmp = (char*)malloc(len + 1);
+                if (tmp) {
+                    memcpy(tmp, data, len);
+                    tmp[len] = '\0';
+                    body = String(tmp);
+                    free(tmp);
+                }
+            }
             String action = "Response";
             String actionResp = "";
 
@@ -1247,7 +1368,11 @@ void setup() {
                           "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" + actionResp + "</u:" + action + ">\r\n"
                           "  </s:Body>\r\n"
                           "</s:Envelope>\r\n";
-            request->send(200, "text/xml; charset=\"utf-8\"", resp);
+            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+            response->addHeader("Connection", "close");
+            response->addHeader("EXT", "");
+            response->addHeader("Access-Control-Allow-Origin", "*");
+            request->send(response);
         }
       });
 
@@ -1255,7 +1380,16 @@ void setup() {
     server.on("/upnp/control/RenderingControl", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index + len >= total) {
-            String body = String((char*)data);
+            String body = "";
+            if (data && len > 0) {
+                char* tmp = (char*)malloc(len + 1);
+                if (tmp) {
+                    memcpy(tmp, data, len);
+                    tmp[len] = '\0';
+                    body = String(tmp);
+                    free(tmp);
+                }
+            }
             String action = "Response";
             String actionResp = "";
 
@@ -1294,7 +1428,53 @@ void setup() {
                           "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">" + actionResp + "</u:" + action + ">\r\n"
                           "  </s:Body>\r\n"
                           "</s:Envelope>\r\n";
-            request->send(200, "text/xml; charset=\"utf-8\"", resp);
+            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+            response->addHeader("Connection", "close");
+            response->addHeader("EXT", "");
+            response->addHeader("Access-Control-Allow-Origin", "*");
+            request->send(response);
+        }
+      });
+
+    // UPnP SOAP ConnectionManager
+    server.on("/upnp/control/ConnectionManager", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index + len >= total) {
+            String body = "";
+            if (data && len > 0) {
+                char* tmp = (char*)malloc(len + 1);
+                if (tmp) {
+                    memcpy(tmp, data, len);
+                    tmp[len] = '\0';
+                    body = String(tmp);
+                    free(tmp);
+                }
+            }
+            String action = "Response";
+            String actionResp = "";
+
+            if (body.indexOf("GetProtocolInfo") >= 0) {
+                action = "GetProtocolInfoResponse";
+                actionResp = "<Source></Source><Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>";
+            } else if (body.indexOf("GetCurrentConnectionIDs") >= 0) {
+                action = "GetCurrentConnectionIDsResponse";
+                actionResp = "<ConnectionIDs>0</ConnectionIDs>";
+            } else if (body.indexOf("GetCurrentConnectionInfo") >= 0) {
+                action = "GetCurrentConnectionInfoResponse";
+                actionResp = "<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>";
+            }
+
+            String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+                          "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+                          "  <s:Body>\r\n"
+                          "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">" + actionResp + "</u:" + action + ">\r\n"
+                          "  </s:Body>\r\n"
+                          "</s:Envelope>\r\n";
+            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+            response->addHeader("Connection", "close");
+            response->addHeader("EXT", "");
+            response->addHeader("Access-Control-Allow-Origin", "*");
+            request->send(response);
         }
       });
 
