@@ -964,14 +964,8 @@ void broadcastSSDPNotify() {
           "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
           "USN: " + usn + "\r\n\r\n";
 
-        // Multicast to Station interface (home Wi-Fi network)
-        if (WiFi.status() == WL_CONNECTED) {
-            ssdpUdp.beginPacketMulticast(SSDP_MULTICAST_IP, SSDP_PORT, WiFi.localIP(), 4);
-            ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
-            ssdpUdp.endPacket();
-        }
-        // Multicast to SoftAP interface
-        ssdpUdp.beginPacketMulticast(SSDP_MULTICAST_IP, SSDP_PORT, WiFi.softAPIP(), 4);
+        // Broadcast to SSDP Multicast address (239.255.255.250:1900)
+        ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
         ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
         ssdpUdp.endPacket();
         delay(2);
