@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <DNSServer.h>
+#include <nvs_flash.h>
 
 // ESP8266Audio Real I2S Multi-Format Decoder Pipeline
 #include "AudioFileSourceHTTPStream.h"
@@ -68,7 +69,8 @@ String savedPass = "";
 // NVS Storage Helper Functions (Safe open/commit/close per call)
 void loadSettingsFromNVS() {
     Preferences p;
-    if (p.begin("audio_node", true)) {
+    // Open in read-write mode (false) so that if the namespace does not exist yet, it is created cleanly
+    if (p.begin("audio_node", false)) {
         currentVolume = p.getInt("volume", 75);
         currentBass = p.getInt("bass", 0);
         currentMid = p.getInt("mid", 0);
@@ -76,9 +78,11 @@ void loadSettingsFromNVS() {
         savedSsid = p.getString("ssid", "");
         savedPass = p.getString("pass", "");
         p.end();
+        Serial.printf("[NVS] Loaded settings: Vol=%d%%, Bass=%d dB, Mid=%d dB, Treble=%d dB, WiFi=%s\n",
+                      currentVolume, currentBass, currentMid, currentTreble, savedSsid.c_str());
+    } else {
+        Serial.println("[NVS] Namespace not initialized, using default audio settings");
     }
-    Serial.printf("[NVS] Loaded settings: Vol=%d%%, Bass=%d dB, Mid=%d dB, Treble=%d dB, WiFi=%s\n",
-                  currentVolume, currentBass, currentMid, currentTreble, savedSsid.c_str());
 }
 
 void saveVolumeToNVS(int vol) {
@@ -1075,12 +1079,12 @@ void startNetworkServices() {
         MDNS.addService("dlna", "tcp", 80);
         MDNS.addServiceTxt("dlna", "tcp", "fn", "ESP32-S3 HiFi Node");
         Serial.println("[mDNS] Responder active at http://esp32-audio.local");
+
+        // 2. Announce AirPlay 1/2 RAOP via mDNS Bonjour once responder is running
+        airplay.announceBonjour();
     } else {
         Serial.println("[mDNS] Error initializing mDNS responder");
     }
-
-    // 2. Announce AirPlay 1/2 RAOP via mDNS Bonjour
-    airplay.announceBonjour();
 
     // 3. Re-bind SSDP Multicast UDP socket (239.255.255.250:1900)
     ssdpUdp.stop();
@@ -1103,6 +1107,18 @@ void setup() {
     Serial.println("\n\n========================================================");
     Serial.println("  ESP32-S3 HiFi Node (UDA1334A DAC • N16R8)");
     Serial.println("========================================================");
+
+    // Initialize NVS storage partition
+    esp_err_t nvsErr = nvs_flash_init();
+    if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvsErr = nvs_flash_init();
+    }
+    if (nvsErr == ESP_OK) {
+        Serial.println("[NVS] Non-volatile storage initialized successfully");
+    } else {
+        Serial.printf("[NVS] Warning: nvs_flash_init error: 0x%x\n", nvsErr);
+    }
 
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, HIGH);

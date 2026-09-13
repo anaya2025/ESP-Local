@@ -23,8 +23,7 @@ bool AirPlayReceiver::begin(const char* deviceName, uint16_t rtspPort, uint16_t 
     _rtpControlUdp.begin(_rtpPort + 1);   // Port 6001: RTP Control
     _rtpTimingUdp.begin(_rtpPort + 2);    // Port 6002: RTP Timing
 
-    announceBonjour();
-    Serial.printf("[AirPlay] RAOP Receiver listening on RTSP port %d, RTP audio ports %d-%d\n", _rtspPort, _rtpPort, _rtpPort + 2);
+    Serial.printf("[AirPlay] RAOP Receiver sockets bound on RTSP port %d, RTP audio ports %d-%d\n", _rtspPort, _rtpPort, _rtpPort + 2);
     return true;
 }
 
@@ -44,27 +43,32 @@ void AirPlayReceiver::announceBonjour() {
         MDNS.addServiceTxt(svc, proto, key, val);
     };
 
-    // 1. Announce _raop._tcp on port 5000: Unencrypted 16-bit 44.1kHz Stereo PCM
-    MDNS.addService("raop", "tcp", _rtspPort);
-    MDNS.setInstanceName(raopServiceName.c_str());
-    mdns_service_instance_name_set("_raop", "_tcp", raopServiceName.c_str());
+    // Remove any previous service registration to avoid duplicate conflict in ESP-IDF mDNS
+    mdns_service_remove("_raop", "_tcp");
 
-    addTxt("raop", "tcp", "tp", "UDP");
-    addTxt("raop", "tcp", "sm", "false");
-    addTxt("raop", "tcp", "sv", "false");
-    addTxt("raop", "tcp", "ek", "0");         // 0 = No encryption key needed
-    addTxt("raop", "tcp", "et", "0");         // 0 = STRICTLY unencrypted stream (prevents iOS FairPlay / RSA failure)
-    addTxt("raop", "tcp", "cn", "0,1");       // 0 = Linear 16-bit PCM, 1 = ALAC
-    addTxt("raop", "tcp", "ch", "2");         // 2 = Stereo channels
-    addTxt("raop", "tcp", "ss", "16");        // 16 = 16-bit sample size
-    addTxt("raop", "tcp", "sr", "44100");     // 44.1 kHz sample rate
-    addTxt("raop", "tcp", "vn", "65537");
-    addTxt("raop", "tcp", "txtvers", "1");
-    addTxt("raop", "tcp", "da", "true");
-    addTxt("raop", "tcp", "md", "0");         // 0 = unencrypted audio
-    addTxt("raop", "tcp", "pw", "false");
+    // Announce _raop._tcp on port 5000: Unencrypted 16-bit 44.1kHz Stereo PCM
+    if (MDNS.addService("raop", "tcp", _rtspPort)) {
+        mdns_service_instance_name_set("_raop", "_tcp", raopServiceName.c_str());
 
-    Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s) on port %d\n", raopServiceName.c_str(), macColonStr, _rtspPort);
+        addTxt("raop", "tcp", "tp", "UDP");
+        addTxt("raop", "tcp", "sm", "false");
+        addTxt("raop", "tcp", "sv", "false");
+        addTxt("raop", "tcp", "ek", "0");         // 0 = No encryption key needed
+        addTxt("raop", "tcp", "et", "0");         // 0 = STRICTLY unencrypted stream (prevents iOS FairPlay / RSA failure)
+        addTxt("raop", "tcp", "cn", "0,1");       // 0 = Linear 16-bit PCM, 1 = ALAC
+        addTxt("raop", "tcp", "ch", "2");         // 2 = Stereo channels
+        addTxt("raop", "tcp", "ss", "16");        // 16 = 16-bit sample size
+        addTxt("raop", "tcp", "sr", "44100");     // 44.1 kHz sample rate
+        addTxt("raop", "tcp", "vn", "65537");
+        addTxt("raop", "tcp", "txtvers", "1");
+        addTxt("raop", "tcp", "da", "true");
+        addTxt("raop", "tcp", "md", "0");         // 0 = unencrypted audio
+        addTxt("raop", "tcp", "pw", "false");
+
+        Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s) on port %d\n", raopServiceName.c_str(), macColonStr, _rtspPort);
+    } else {
+        Serial.printf("[AirPlay] Error: Unable to register _raop._tcp on port %d (mDNS not running?)\n", _rtspPort);
+    }
 }
 
 void AirPlayReceiver::loop() {
