@@ -157,6 +157,15 @@ export default function App() {
 
           <div className="flex items-center gap-2">
             <button
+              onClick={() => setIsTerminalOpen(true)}
+              className="text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold transition hover:underline"
+              title="Run interactive Virtual Flash and hardware verification"
+            >
+              <Terminal className="w-3 h-3 text-emerald-400" />
+              <span>Virtual Flash & Verify</span>
+            </button>
+            <span className="text-slate-600">•</span>
+            <button
               onClick={() => setIsMergedBinModalOpen(true)}
               className="text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold transition hover:underline"
             >

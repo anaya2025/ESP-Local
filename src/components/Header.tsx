@@ -49,10 +49,12 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             id="btn-view-terminal"
             onClick={onViewTerminal}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 hover:text-white rounded-lg border border-slate-700 transition"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-300 bg-emerald-950/60 hover:bg-emerald-900/80 rounded-lg border border-emerald-500/40 hover:border-emerald-400 transition shadow-sm"
+            title="Simulate virtual flash, sector erase, CRC verification, and ESP32-S3 boot monitor"
           >
-            <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Boot Simulator</span>
+            <Zap className="w-3.5 h-3.5 text-emerald-400 fill-emerald-400" />
+            <span>Virtual Flash & Boot</span>
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
           </button>
 
           <button
