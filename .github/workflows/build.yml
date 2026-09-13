@@ -37,7 +37,9 @@ jobs:
             ${{ runner.os }}-pio-
 
       - name: Compile ESP32-S3 Firmware
-        run: pio run
+        run: |
+          pio run --target clean || true
+          pio run
 
       - name: Assemble Factory merged.bin (Single Flash Image @ 0x0)
         run: |

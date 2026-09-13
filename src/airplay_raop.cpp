@@ -46,7 +46,7 @@ void AirPlayReceiver::announceBonjour() {
 
     // 1. Announce _raop._tcp on port 5000: Unencrypted 16-bit 44.1kHz Stereo PCM
     MDNS.addService("raop", "tcp", _rtspPort);
-    MDNS.setInstanceName(raopServiceName);
+    MDNS.setInstanceName(raopServiceName.c_str());
     mdns_service_instance_name_set("_raop", "_tcp", raopServiceName.c_str());
 
     addTxt("raop", "tcp", "tp", "UDP");
@@ -64,19 +64,7 @@ void AirPlayReceiver::announceBonjour() {
     addTxt("raop", "tcp", "md", "0,1,2");
     addTxt("raop", "tcp", "pw", "false");
 
-    // 2. Announce _airplay._tcp on port 5000: Standard AppleTV/Airport audio target
-    MDNS.addService("airplay", "tcp", _rtspPort);
-    mdns_service_instance_name_set("_airplay", "_tcp", _deviceName.c_str());
-
-    addTxt("airplay", "tcp", "model", "AppleTV2,1");
-    addTxt("airplay", "tcp", "srcvers", "220.68");
-    addTxt("airplay", "tcp", "features", "0x7");
-    addTxt("airplay", "tcp", "flags", "0x4");
-    addTxt("airplay", "tcp", "deviceid", String(macColonStr));
-    addTxt("airplay", "tcp", "acl", "0");
-    addTxt("airplay", "tcp", "pw", "false");
-
-    Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s)\n", raopServiceName.c_str(), macColonStr);
+    Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s) on port %d\n", raopServiceName.c_str(), macColonStr, _rtspPort);
 }
 
 void AirPlayReceiver::loop() {
@@ -106,8 +94,8 @@ void AirPlayReceiver::_handleRtspRequests() {
         _clientConnected = true;
         _rtspClient.setTimeout(50);
         _clientName = _rtspClient.remoteIP().toString();
+        _lastKeepAlive = millis();
         Serial.printf("[AirPlay] iOS / macOS client connected from %s\n", _clientName.c_str());
-        if (_onState) _onState(true);
     }
 
     if (_rtspClient && _rtspClient.available()) {

@@ -6,6 +6,7 @@
 #include <Update.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <DNSServer.h>
 
 // ESP8266Audio Real I2S Multi-Format Decoder Pipeline
 #include "AudioFileSourceHTTPStream.h"
@@ -27,12 +28,21 @@
 // Allocate 256KB Ring Buffer in 8MB PSRAM for stutter-free audio streaming
 #define PSRAM_BUFFER_SIZE (256 * 1024)
 
+#ifndef DEFAULT_WIFI_SSID
+#define DEFAULT_WIFI_SSID ""
+#endif
+#ifndef DEFAULT_WIFI_PASS
+#define DEFAULT_WIFI_PASS ""
+#endif
+
 AsyncWebServer server(80);
 WiFiUDP ssdpUdp;
 AirPlayReceiver airplay;
+DNSServer dnsServer;
 const IPAddress SSDP_MULTICAST_IP(239, 255, 255, 250);
 const unsigned int SSDP_PORT = 1900;
 static volatile bool pendingStaGotIp = false;
+static volatile bool pendingWifiReconnect = false;
 
 // Audio Pipeline Polymorphic Pointers
 AudioFileSourceHTTPStream *httpStream = nullptr;
@@ -1139,6 +1149,18 @@ void setup() {
     WiFi.softAP("ESP32S3-HiFi-Node", "12345678");
     Serial.printf("[WIFI] SoftAP active! SSID: ESP32S3-HiFi-Node (Pass: 12345678), IP: %s\n", WiFi.softAPIP().toString().c_str());
 
+    // Start Captive Portal DNS Server on port 53 (redirects all domains to 192.168.4.1)
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    Serial.println("[DNS] Captive Portal active on port 53");
+
+    // Fallback default WiFi if NVS has no credentials
+    if (savedSsid.length() == 0 && strlen(DEFAULT_WIFI_SSID) > 0) {
+        savedSsid = DEFAULT_WIFI_SSID;
+        savedPass = DEFAULT_WIFI_PASS;
+        saveWifiToNVS(savedSsid, savedPass);
+    }
+
     // Auto-connect using saved NVS WiFi credentials if available
     if (savedSsid.length() > 0) {
         Serial.printf("[WIFI] Auto-connecting to saved network: %s\n", savedSsid.c_str());
@@ -1163,13 +1185,6 @@ void setup() {
     });
 
     server.on("/upnp/desc.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
-        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
-        response->addHeader("Connection", "close");
-        response->addHeader("Access-Control-Allow-Origin", "*");
-        request->send(response);
-    });
-
-    server.on("/description.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
         response->addHeader("Connection", "close");
         response->addHeader("Access-Control-Allow-Origin", "*");
@@ -1293,10 +1308,8 @@ void setup() {
         if (ssid.length() > 0) {
             saveWifiToNVS(ssid, pass);
             request->send(200, "text/plain", "OK");
-            Serial.printf("[WIFI] Received new credentials for SSID '%s'. Connecting...\n", ssid.c_str());
-            WiFi.disconnect(false);
-            delay(100);
-            WiFi.begin(ssid.c_str(), pass.c_str());
+            Serial.printf("[WIFI] Received credentials for SSID '%s'. Scheduling reconnect...\n", ssid.c_str());
+            pendingWifiReconnect = true;
         } else {
             request->send(400, "text/plain", "Missing SSID");
         }
@@ -1313,14 +1326,16 @@ void setup() {
         Serial.printf("[AUDIO] Tone EQ saved to NVS: Bass=%d dB, Mid=%d dB, Treble=%d dB\n", b, m, t);
         request->send(200, "text/plain", "OK");
     });
+
     server.on("/connect", HTTP_POST, [](AsyncWebServerRequest *request) {
         String ssid = "";
         String pass = "";
         if (request->hasArg("ssid")) ssid = request->arg("ssid");
         if (request->hasArg("pass")) pass = request->arg("pass");
         if (ssid.length() > 0) {
-            WiFi.begin(ssid.c_str(), pass.c_str());
-            request->send(200, "text/html", "<h3>Connecting to " + ssid + "...</h3><p>Check serial monitor or IP address.</p><a href='/'>Back</a>");
+            saveWifiToNVS(ssid, pass);
+            pendingWifiReconnect = true;
+            request->send(200, "text/html", "<h3>Connecting to " + ssid + "...</h3><p>Connecting in background.</p><a href='/'>Back</a>");
         } else {
             request->send(400, "text/plain", "Missing SSID");
         }
@@ -1369,145 +1384,181 @@ void setup() {
     server.on("/upnp/control/ConnectionManager", HTTP_OPTIONS, sendOptionsResponse);
 
     // UPnP SOAP AVTransport Control
-    server.on("/upnp/control/AVTransport", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
-      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (index + len >= total) {
-            String body = (data && len > 0) ? String((const char*)data, len) : "";
-            String action = "Response";
-            String actionResp = "";
-
-            if (body.indexOf("SetAVTransportURI") >= 0) {
-                action = "SetAVTransportURIResponse";
-                int u1 = body.indexOf("<CurrentURI>");
-                int u2 = body.indexOf("</CurrentURI>");
-                if (u1 > 0 && u2 > u1) {
-                    String uri = body.substring(u1 + 12, u2);
-                    uri.replace("&amp;", "&");
-                    startAudioStream(uri, "DLNA Audio Track");
-                }
-            } else if (body.indexOf("<u:Play") >= 0) {
-                action = "PlayResponse";
-                if (!isPlaying && currentUrl.length() > 0) {
-                    startAudioStream(currentUrl, currentTrack);
-                }
-            } else if (body.indexOf("<u:Pause") >= 0) {
-                action = "PauseResponse";
-                stopAudioPlayback();
-            } else if (body.indexOf("<u:Stop") >= 0) {
-                action = "StopResponse";
-                stopAudioPlayback();
-            } else if (body.indexOf("GetTransportInfo") >= 0) {
-                action = "GetTransportInfoResponse";
-                String state = isPlaying ? "PLAYING" : "STOPPED";
-                actionResp = "<CurrentTransportState>" + state + "</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>";
-            } else if (body.indexOf("GetPositionInfo") >= 0) {
-                action = "GetPositionInfoResponse";
-                actionResp = "<Track>1</Track><TrackDuration>00:00:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>" + currentUrl + "</TrackURI><RelTime>00:00:00</RelTime><AbsTime>00:00:00</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>";
-            } else if (body.indexOf("GetMediaInfo") >= 0) {
-                action = "GetMediaInfoResponse";
-                actionResp = "<NrTracks>1</NrTracks><MediaDuration>00:00:00</MediaDuration><CurrentURI>" + currentUrl + "</CurrentURI><CurrentURIMetaData></CurrentURIMetaData><NextURI></NextURI><NextURIMetaData></NextURIMetaData><PlayMedium>NETWORK</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium><WriteStatus>NOT_IMPLEMENTED</WriteStatus>";
-            } else if (body.indexOf("GetDeviceCapabilities") >= 0) {
-                action = "GetDeviceCapabilitiesResponse";
-                actionResp = "<PlayMedia>NETWORK</PlayMedia><RecMedia>NOT_IMPLEMENTED</RecMedia><RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>";
-            }
-
-            String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
-                          "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
-                          "  <s:Body>\r\n"
-                          "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" + actionResp + "</u:" + action + ">\r\n"
-                          "  </s:Body>\r\n"
-                          "</s:Envelope>\r\n";
-            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
-            response->addHeader("Connection", "close");
-            response->addHeader("EXT", "");
-            response->addHeader("Access-Control-Allow-Origin", "*");
-            request->send(response);
+    server.on("/upnp/control/AVTransport", HTTP_POST, [](AsyncWebServerRequest *request) {
+        String *bodyPtr = (String*)request->_tempObject;
+        String body = bodyPtr ? *bodyPtr : "";
+        if (bodyPtr) {
+            delete bodyPtr;
+            request->_tempObject = nullptr;
         }
-      });
+
+        String action = "Response";
+        String actionResp = "";
+
+        if (body.indexOf("SetAVTransportURI") >= 0) {
+            action = "SetAVTransportURIResponse";
+            int u1 = body.indexOf("<CurrentURI>");
+            int u2 = body.indexOf("</CurrentURI>");
+            if (u1 > 0 && u2 > u1) {
+                String uri = body.substring(u1 + 12, u2);
+                uri.replace("&amp;", "&");
+                startAudioStream(uri, "DLNA Audio Track");
+            }
+        } else if (body.indexOf("<u:Play") >= 0) {
+            action = "PlayResponse";
+            if (!isPlaying && currentUrl.length() > 0) {
+                startAudioStream(currentUrl, currentTrack);
+            }
+        } else if (body.indexOf("<u:Pause") >= 0) {
+            action = "PauseResponse";
+            stopAudioPlayback();
+        } else if (body.indexOf("<u:Stop") >= 0) {
+            action = "StopResponse";
+            stopAudioPlayback();
+        } else if (body.indexOf("GetTransportInfo") >= 0) {
+            action = "GetTransportInfoResponse";
+            String state = isPlaying ? "PLAYING" : "STOPPED";
+            actionResp = "<CurrentTransportState>" + state + "</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>";
+        } else if (body.indexOf("GetPositionInfo") >= 0) {
+            action = "GetPositionInfoResponse";
+            actionResp = "<Track>1</Track><TrackDuration>00:00:00</TrackDuration><TrackMetaData></TrackMetaData><TrackURI>" + currentUrl + "</TrackURI><RelTime>00:00:00</RelTime><AbsTime>00:00:00</AbsTime><RelCount>0</RelCount><AbsCount>0</AbsCount>";
+        } else if (body.indexOf("GetMediaInfo") >= 0) {
+            action = "GetMediaInfoResponse";
+            actionResp = "<NrTracks>1</NrTracks><MediaDuration>00:00:00</MediaDuration><CurrentURI>" + currentUrl + "</CurrentURI><CurrentURIMetaData></CurrentURIMetaData><NextURI></NextURI><NextURIMetaData></NextURIMetaData><PlayMedium>NETWORK</PlayMedium><RecordMedium>NOT_IMPLEMENTED</RecordMedium><WriteStatus>NOT_IMPLEMENTED</WriteStatus>";
+        } else if (body.indexOf("GetDeviceCapabilities") >= 0) {
+            action = "GetDeviceCapabilitiesResponse";
+            actionResp = "<PlayMedia>NETWORK</PlayMedia><RecMedia>NOT_IMPLEMENTED</RecMedia><RecQualityModes>NOT_IMPLEMENTED</RecQualityModes>";
+        }
+
+        String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+                      "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+                      "  <s:Body>\r\n"
+                      "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" + actionResp + "</u:" + action + ">\r\n"
+                      "  </s:Body>\r\n"
+                      "</s:Envelope>\r\n";
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+        response->addHeader("Connection", "close");
+        response->addHeader("EXT", "");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        String *bodyPtr = (String*)request->_tempObject;
+        if (!bodyPtr) {
+            bodyPtr = new String();
+            request->_tempObject = bodyPtr;
+        }
+        if (data && len > 0) {
+            bodyPtr->concat((const char*)data, len);
+        }
+    });
 
     // UPnP SOAP RenderingControl
-    server.on("/upnp/control/RenderingControl", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
-      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (index + len >= total) {
-            String body = (data && len > 0) ? String((const char*)data, len) : "";
-            String action = "Response";
-            String actionResp = "";
-
-            if (body.indexOf("SetVolume") >= 0) {
-                action = "SetVolumeResponse";
-                int v1 = body.indexOf("<DesiredVolume>");
-                int v2 = body.indexOf("</DesiredVolume>");
-                if (v1 > 0 && v2 > v1) {
-                    currentVolume = body.substring(v1 + 15, v2).toInt();
-                    if (i2sOutput && !isMuted) {
-                        i2sOutput->SetGain((float)currentVolume / 100.0f);
-                    }
-                    saveVolumeToNVS(currentVolume);
-                }
-            } else if (body.indexOf("GetVolume") >= 0) {
-                action = "GetVolumeResponse";
-                actionResp = "<CurrentVolume>" + String(currentVolume) + "</CurrentVolume>";
-            } else if (body.indexOf("SetMute") >= 0) {
-                action = "SetMuteResponse";
-                int m1 = body.indexOf("<DesiredMute>");
-                int m2 = body.indexOf("</DesiredMute>");
-                if (m1 > 0 && m2 > m1) {
-                    isMuted = (body.substring(m1 + 13, m2).toInt() == 1);
-                    if (i2sOutput) {
-                        i2sOutput->SetGain(isMuted ? 0.0f : ((float)currentVolume / 100.0f));
-                    }
-                }
-            } else if (body.indexOf("GetMute") >= 0) {
-                action = "GetMuteResponse";
-                actionResp = "<CurrentMute>" + String(isMuted ? "1" : "0") + "</CurrentMute>";
-            }
-
-            String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
-                          "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
-                          "  <s:Body>\r\n"
-                          "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">" + actionResp + "</u:" + action + ">\r\n"
-                          "  </s:Body>\r\n"
-                          "</s:Envelope>\r\n";
-            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
-            response->addHeader("Connection", "close");
-            response->addHeader("EXT", "");
-            response->addHeader("Access-Control-Allow-Origin", "*");
-            request->send(response);
+    server.on("/upnp/control/RenderingControl", HTTP_POST, [](AsyncWebServerRequest *request) {
+        String *bodyPtr = (String*)request->_tempObject;
+        String body = bodyPtr ? *bodyPtr : "";
+        if (bodyPtr) {
+            delete bodyPtr;
+            request->_tempObject = nullptr;
         }
-      });
+
+        String action = "Response";
+        String actionResp = "";
+
+        if (body.indexOf("SetVolume") >= 0) {
+            action = "SetVolumeResponse";
+            int v1 = body.indexOf("<DesiredVolume>");
+            int v2 = body.indexOf("</DesiredVolume>");
+            if (v1 > 0 && v2 > v1) {
+                currentVolume = body.substring(v1 + 15, v2).toInt();
+                if (i2sOutput && !isMuted) {
+                    i2sOutput->SetGain((float)currentVolume / 100.0f);
+                }
+                saveVolumeToNVS(currentVolume);
+            }
+        } else if (body.indexOf("GetVolume") >= 0) {
+            action = "GetVolumeResponse";
+            actionResp = "<CurrentVolume>" + String(currentVolume) + "</CurrentVolume>";
+        } else if (body.indexOf("SetMute") >= 0) {
+            action = "SetMuteResponse";
+            int m1 = body.indexOf("<DesiredMute>");
+            int m2 = body.indexOf("</DesiredMute>");
+            if (m1 > 0 && m2 > m1) {
+                isMuted = (body.substring(m1 + 13, m2).toInt() == 1);
+                if (i2sOutput) {
+                    i2sOutput->SetGain(isMuted ? 0.0f : ((float)currentVolume / 100.0f));
+                }
+            }
+        } else if (body.indexOf("GetMute") >= 0) {
+            action = "GetMuteResponse";
+            actionResp = "<CurrentMute>" + String(isMuted ? "1" : "0") + "</CurrentMute>";
+        }
+
+        String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+                      "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+                      "  <s:Body>\r\n"
+                      "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\">" + actionResp + "</u:" + action + ">\r\n"
+                      "  </s:Body>\r\n"
+                      "</s:Envelope>\r\n";
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+        response->addHeader("Connection", "close");
+        response->addHeader("EXT", "");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        String *bodyPtr = (String*)request->_tempObject;
+        if (!bodyPtr) {
+            bodyPtr = new String();
+            request->_tempObject = bodyPtr;
+        }
+        if (data && len > 0) {
+            bodyPtr->concat((const char*)data, len);
+        }
+    });
 
     // UPnP SOAP ConnectionManager
-    server.on("/upnp/control/ConnectionManager", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
-      [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (index + len >= total) {
-            String body = (data && len > 0) ? String((const char*)data, len) : "";
-            String action = "Response";
-            String actionResp = "";
-
-            if (body.indexOf("GetProtocolInfo") >= 0) {
-                action = "GetProtocolInfoResponse";
-                actionResp = "<Source></Source><Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>";
-            } else if (body.indexOf("GetCurrentConnectionIDs") >= 0) {
-                action = "GetCurrentConnectionIDsResponse";
-                actionResp = "<ConnectionIDs>0</ConnectionIDs>";
-            } else if (body.indexOf("GetCurrentConnectionInfo") >= 0) {
-                action = "GetCurrentConnectionInfoResponse";
-                actionResp = "<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>";
-            }
-
-            String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
-                          "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
-                          "  <s:Body>\r\n"
-                          "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">" + actionResp + "</u:" + action + ">\r\n"
-                          "  </s:Body>\r\n"
-                          "</s:Envelope>\r\n";
-            AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
-            response->addHeader("Connection", "close");
-            response->addHeader("EXT", "");
-            response->addHeader("Access-Control-Allow-Origin", "*");
-            request->send(response);
+    server.on("/upnp/control/ConnectionManager", HTTP_POST, [](AsyncWebServerRequest *request) {
+        String *bodyPtr = (String*)request->_tempObject;
+        String body = bodyPtr ? *bodyPtr : "";
+        if (bodyPtr) {
+            delete bodyPtr;
+            request->_tempObject = nullptr;
         }
-      });
+
+        String action = "Response";
+        String actionResp = "";
+
+        if (body.indexOf("GetProtocolInfo") >= 0) {
+            action = "GetProtocolInfoResponse";
+            actionResp = "<Source></Source><Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>";
+        } else if (body.indexOf("GetCurrentConnectionIDs") >= 0) {
+            action = "GetCurrentConnectionIDsResponse";
+            actionResp = "<ConnectionIDs>0</ConnectionIDs>";
+        } else if (body.indexOf("GetCurrentConnectionInfo") >= 0) {
+            action = "GetCurrentConnectionInfoResponse";
+            actionResp = "<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Input</Direction><Status>OK</Status>";
+        }
+
+        String resp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+                      "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+                      "  <s:Body>\r\n"
+                      "    <u:" + action + " xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">" + actionResp + "</u:" + action + ">\r\n"
+                      "  </s:Body>\r\n"
+                      "</s:Envelope>\r\n";
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/xml; charset=\"utf-8\"", resp);
+        response->addHeader("Connection", "close");
+        response->addHeader("EXT", "");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        String *bodyPtr = (String*)request->_tempObject;
+        if (!bodyPtr) {
+            bodyPtr = new String();
+            request->_tempObject = bodyPtr;
+        }
+        if (data && len > 0) {
+            bodyPtr->concat((const char*)data, len);
+        }
+    });
 
     // UPnP GENA EventSub endpoints (returns 200 OK with SID and TIMEOUT for DLNA controllers)
     auto handleEventSub = [](AsyncWebServerRequest *request) {
@@ -1531,6 +1582,11 @@ void setup() {
             response->addHeader("TIMEOUT", "Second-1800");
             response->addHeader("Access-Control-Allow-Origin", "*");
             request->send(response);
+            return;
+        }
+        // Captive portal detection & redirect for SoftAP clients
+        if (WiFi.status() != WL_CONNECTED || request->host().indexOf("192.168.4.1") >= 0 || request->url().indexOf("hotspot") >= 0 || request->url().indexOf("generate_204") >= 0) {
+            request->redirect("http://192.168.4.1/");
             return;
         }
         request->send(404, "text/plain", "Not Found");
@@ -1587,9 +1643,20 @@ void setup() {
 }
 
 void loop() {
+    dnsServer.processNextRequest();
+
     if (pendingStaGotIp) {
         pendingStaGotIp = false;
         startNetworkServices();
+    }
+
+    if (pendingWifiReconnect) {
+        pendingWifiReconnect = false;
+        vTaskDelay(pdMS_TO_TICKS(500));
+        WiFi.disconnect(false);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        WiFi.begin(savedSsid.c_str(), savedPass.c_str());
+        Serial.printf("[WIFI] Attempting connection to '%s'...\n", savedSsid.c_str());
     }
 
     if (activeDecoder && activeDecoder->isRunning()) {
@@ -1603,7 +1670,7 @@ void loop() {
     airplay.loop();
 
     static unsigned long lastNotify = 0;
-    if (millis() - lastNotify > 60000) {
+    if (millis() - lastNotify > 30000) {
         lastNotify = millis();
         broadcastSSDPNotify();
     }
