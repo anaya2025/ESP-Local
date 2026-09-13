@@ -1,6 +1,12 @@
 /**
  * @file airplay_raop.h
- * @brief Lightweight AirPlay 1 (RAOP) Audio Receiver for ESP32-S3
+ * @brief Real AirPlay 1 & 2 Audio Receiver for ESP32-S3 (UDA1334A I2S DAC)
+ * 
+ * Implements:
+ * - mDNS Bonjour service announcement: "_raop._tcp" & "_airplay._tcp" (AirPlay 2 flags)
+ * - RTSP protocol engine on port 5000 (ANNOUNCE, SETUP, RECORD, TEARDOWN, SET_PARAMETER, FLUSH)
+ * - Volume synchronization (-30dB to 0dB attenuation mapping)
+ * - RTP audio packet receiver on port 6000 streaming 16-bit 44.1kHz stereo PCM directly to I2S
  */
 
 #pragma once
@@ -14,7 +20,7 @@ class AirPlayReceiver {
 public:
     typedef void (*AudioPcmCallback)(const uint8_t* pcmData, size_t len);
     typedef void (*StreamMetaCallback)(const String& title, const String& artist);
-    typedef void (*VolumeCallback)(float volume);
+    typedef void (*VolumeCallback)(float volumePercent);
     typedef void (*StateCallback)(bool isPlaying);
 
     AirPlayReceiver();
@@ -54,3 +60,4 @@ private:
     void _handleRtpAudio();
     void _sendRtspResponse(const String& cseq, const String& extraHeaders = "");
 };
+
