@@ -30,9 +30,9 @@
 AsyncWebServer server(80);
 WiFiUDP ssdpUdp;
 AirPlayReceiver airplay;
-Preferences prefs;
 const IPAddress SSDP_MULTICAST_IP(239, 255, 255, 250);
 const unsigned int SSDP_PORT = 1900;
+static volatile bool pendingStaGotIp = false;
 
 // Audio Pipeline Polymorphic Pointers
 AudioFileSourceHTTPStream *httpStream = nullptr;
@@ -55,34 +55,49 @@ String currentCodec = "None"; // MP3, AAC, FLAC, Opus, AirPlay
 String savedSsid = "";
 String savedPass = "";
 
-// NVS Storage Helper Functions
+// NVS Storage Helper Functions (Safe open/commit/close per call)
 void loadSettingsFromNVS() {
-    prefs.begin("audio_node", false);
-    currentVolume = prefs.getInt("volume", 75);
-    currentBass = prefs.getInt("bass", 0);
-    currentMid = prefs.getInt("mid", 0);
-    currentTreble = prefs.getInt("treble", 0);
-    savedSsid = prefs.getString("ssid", "");
-    savedPass = prefs.getString("pass", "");
+    Preferences p;
+    if (p.begin("audio_node", true)) {
+        currentVolume = p.getInt("volume", 75);
+        currentBass = p.getInt("bass", 0);
+        currentMid = p.getInt("mid", 0);
+        currentTreble = p.getInt("treble", 0);
+        savedSsid = p.getString("ssid", "");
+        savedPass = p.getString("pass", "");
+        p.end();
+    }
     Serial.printf("[NVS] Loaded settings: Vol=%d%%, Bass=%d dB, Mid=%d dB, Treble=%d dB, WiFi=%s\n",
                   currentVolume, currentBass, currentMid, currentTreble, savedSsid.c_str());
 }
 
 void saveVolumeToNVS(int vol) {
-    prefs.putInt("volume", vol);
+    Preferences p;
+    if (p.begin("audio_node", false)) {
+        p.putInt("volume", vol);
+        p.end();
+    }
 }
 
 void saveToneToNVS(int b, int m, int t) {
-    prefs.putInt("bass", b);
-    prefs.putInt("mid", m);
-    prefs.putInt("treble", t);
+    Preferences p;
+    if (p.begin("audio_node", false)) {
+        p.putInt("bass", b);
+        p.putInt("mid", m);
+        p.putInt("treble", t);
+        p.end();
+    }
 }
 
 void saveWifiToNVS(const String& ssid, const String& pass) {
     savedSsid = ssid;
     savedPass = pass;
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass);
+    Preferences p;
+    if (p.begin("audio_node", false)) {
+        p.putString("ssid", ssid);
+        p.putString("pass", pass);
+        p.end();
+    }
     Serial.printf("[NVS] Wi-Fi credentials saved for SSID: %s\n", ssid.c_str());
 }
 
@@ -952,7 +967,6 @@ void broadcastSSDPNotify() {
         ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
         ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
         ssdpUdp.endPacket();
-        delay(2);
     }
 }
 
@@ -1022,11 +1036,12 @@ void setup() {
     loadSettingsFromNVS();
 
     #if defined(BOARD_HAS_PSRAM)
-    if (psramInit()) {
+    if (psramFound()) {
         psramBufferMemory = (uint8_t*)ps_malloc(PSRAM_BUFFER_SIZE);
         if (psramBufferMemory) {
             actualBufferSize = PSRAM_BUFFER_SIZE;
-            Serial.printf("[PSRAM] Allocated %d KB buffer in PSRAM\n", (int)(PSRAM_BUFFER_SIZE / 1024));
+            Serial.printf("[PSRAM] Allocated %d KB buffer in PSRAM (Free PSRAM: %u bytes)\n", 
+                          (int)(PSRAM_BUFFER_SIZE / 1024), ESP.getFreePsram());
         }
     }
     #endif
@@ -1061,12 +1076,7 @@ void setup() {
                 Serial.printf("[WIFI] Signal RSSI: %d dBm\n", WiFi.RSSI());
                 Serial.println("[mDNS] Web player accessible at: http://esp32-audio.local");
                 Serial.println("========================================================\n");
-                // Re-bind SSDP multicast on station interface so multicast packets route onto the LAN
-                ssdpUdp.stop();
-                if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
-                    Serial.println("[SSDP] Multicast re-bound on STA interface 239.255.255.250:1900");
-                }
-                broadcastSSDPNotify();
+                pendingStaGotIp = true;
                 break;
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
                 Serial.printf("[WIFI] Disconnected from station. Reason code: %d\n", info.wifi_sta_disconnected.reason);
@@ -1314,16 +1324,7 @@ void setup() {
     server.on("/upnp/control/AVTransport", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index + len >= total) {
-            String body = "";
-            if (data && len > 0) {
-                char* tmp = (char*)malloc(len + 1);
-                if (tmp) {
-                    memcpy(tmp, data, len);
-                    tmp[len] = '\0';
-                    body = String(tmp);
-                    free(tmp);
-                }
-            }
+            String body = (data && len > 0) ? String((const char*)data, len) : "";
             String action = "Response";
             String actionResp = "";
 
@@ -1380,16 +1381,7 @@ void setup() {
     server.on("/upnp/control/RenderingControl", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index + len >= total) {
-            String body = "";
-            if (data && len > 0) {
-                char* tmp = (char*)malloc(len + 1);
-                if (tmp) {
-                    memcpy(tmp, data, len);
-                    tmp[len] = '\0';
-                    body = String(tmp);
-                    free(tmp);
-                }
-            }
+            String body = (data && len > 0) ? String((const char*)data, len) : "";
             String action = "Response";
             String actionResp = "";
 
@@ -1440,16 +1432,7 @@ void setup() {
     server.on("/upnp/control/ConnectionManager", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
       [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index + len >= total) {
-            String body = "";
-            if (data && len > 0) {
-                char* tmp = (char*)malloc(len + 1);
-                if (tmp) {
-                    memcpy(tmp, data, len);
-                    tmp[len] = '\0';
-                    body = String(tmp);
-                    free(tmp);
-                }
-            }
+            String body = (data && len > 0) ? String((const char*)data, len) : "";
             String action = "Response";
             String actionResp = "";
 
@@ -1529,6 +1512,15 @@ void setup() {
 }
 
 void loop() {
+    if (pendingStaGotIp) {
+        pendingStaGotIp = false;
+        ssdpUdp.stop();
+        if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
+            Serial.println("[SSDP] Multicast re-bound on STA interface 239.255.255.250:1900");
+        }
+        broadcastSSDPNotify();
+    }
+
     if (activeDecoder && activeDecoder->isRunning()) {
         if (!activeDecoder->loop()) {
             Serial.printf("[AUDIO] %s stream playback ended or stalled\n", currentCodec.c_str());
