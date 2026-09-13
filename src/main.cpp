@@ -75,11 +75,16 @@ void loadSettingsFromNVS() {
         currentBass = p.getInt("bass", 0);
         currentMid = p.getInt("mid", 0);
         currentTreble = p.getInt("treble", 0);
-        savedSsid = p.getString("ssid", "");
-        savedPass = p.getString("pass", "");
+        if (p.isKey("ssid")) {
+            savedSsid = p.getString("ssid", "");
+        }
+        if (p.isKey("pass")) {
+            savedPass = p.getString("pass", "");
+        }
         p.end();
         Serial.printf("[NVS] Loaded settings: Vol=%d%%, Bass=%d dB, Mid=%d dB, Treble=%d dB, WiFi=%s\n",
-                      currentVolume, currentBass, currentMid, currentTreble, savedSsid.c_str());
+                      currentVolume, currentBass, currentMid, currentTreble, 
+                      savedSsid.length() > 0 ? savedSsid.c_str() : "(Not configured - SoftAP Mode)");
     } else {
         Serial.println("[NVS] Namespace not initialized, using default audio settings");
     }
