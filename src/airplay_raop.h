@@ -50,6 +50,8 @@ private:
     bool _clientConnected;
     String _clientName;
     unsigned long _lastKeepAlive;
+    uint16_t _clientControlPort;
+    uint16_t _clientTimingPort;
 
     AudioPcmCallback _onAudioPcm;
     StreamMetaCallback _onMeta;
@@ -58,6 +60,7 @@ private:
 
     void _handleRtspRequests();
     void _handleRtpAudio();
+    void _handleRtpTiming();
     void _sendRtspResponse(const String& cseq, const String& extraHeaders = "");
 };
 

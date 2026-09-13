@@ -53,7 +53,7 @@ void AirPlayReceiver::announceBonjour() {
     addTxt("raop", "tcp", "sm", "false");
     addTxt("raop", "tcp", "sv", "false");
     addTxt("raop", "tcp", "ek", "0");         // 0 = No encryption key needed
-    addTxt("raop", "tcp", "et", "0,1");       // 0 = Unencrypted stream (standard RAOP)
+    addTxt("raop", "tcp", "et", "0");         // 0 = STRICTLY unencrypted stream (prevents iOS FairPlay / RSA failure)
     addTxt("raop", "tcp", "cn", "0,1");       // 0 = Linear 16-bit PCM, 1 = ALAC
     addTxt("raop", "tcp", "ch", "2");         // 2 = Stereo channels
     addTxt("raop", "tcp", "ss", "16");        // 16 = 16-bit sample size
@@ -61,7 +61,7 @@ void AirPlayReceiver::announceBonjour() {
     addTxt("raop", "tcp", "vn", "65537");
     addTxt("raop", "tcp", "txtvers", "1");
     addTxt("raop", "tcp", "da", "true");
-    addTxt("raop", "tcp", "md", "0,1,2");
+    addTxt("raop", "tcp", "md", "0");         // 0 = unencrypted audio
     addTxt("raop", "tcp", "pw", "false");
 
     Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s) on port %d\n", raopServiceName.c_str(), macColonStr, _rtspPort);
@@ -70,17 +70,57 @@ void AirPlayReceiver::announceBonjour() {
 void AirPlayReceiver::loop() {
     _handleRtspRequests();
     _handleRtpAudio();
+    _handleRtpTiming();
 
-    // Drain control and timing sockets to keep network buffers clean
+    // Drain control socket to keep network buffers clean
     if (_rtpControlUdp.parsePacket() > 0) {
         _rtpControlUdp.flush();
-    }
-    if (_rtpTimingUdp.parsePacket() > 0) {
-        _rtpTimingUdp.flush();
     }
 
     if (_clientConnected && (!_rtspClient || !_rtspClient.connected())) {
         stop();
+    }
+}
+
+void AirPlayReceiver::_handleRtpTiming() {
+    int packetSize = _rtpTimingUdp.parsePacket();
+    if (packetSize >= 32) {
+        uint8_t req[32];
+        int len = _rtpTimingUdp.read(req, sizeof(req));
+        if (len >= 32) {
+            // Check for timing request (payload type 0x52 or 0x82 or 0xD2)
+            uint8_t pt = req[1] & 0x7F;
+            if (pt == 0x52 || pt == 0x02 || (req[1] == 0xD2) || (req[1] == 0x82)) {
+                uint8_t resp[32];
+                memset(resp, 0, sizeof(resp));
+                resp[0] = 0x80;
+                resp[1] = 0x53; // Timing reply payload type
+                resp[2] = req[2]; // Echo sequence number
+                resp[3] = req[3];
+                // Echo origin timestamp from request transmit timestamp (bytes 24-31)
+                memcpy(&resp[8], &req[24], 8);
+
+                // Current time in 64-bit microsecond NTP timestamp
+                uint64_t nowUs = (uint64_t)esp_timer_get_time();
+                uint32_t sec = (uint32_t)(nowUs / 1000000ULL);
+                uint32_t frac = (uint32_t)(((nowUs % 1000000ULL) * 4294967296ULL) / 1000000ULL);
+
+                // Receive timestamp (bytes 16-23)
+                resp[16] = (sec >> 24) & 0xFF; resp[17] = (sec >> 16) & 0xFF;
+                resp[18] = (sec >> 8) & 0xFF;  resp[19] = sec & 0xFF;
+                resp[20] = (frac >> 24) & 0xFF; resp[21] = (frac >> 16) & 0xFF;
+                resp[22] = (frac >> 8) & 0xFF;  resp[23] = frac & 0xFF;
+
+                // Transmit timestamp (bytes 24-31)
+                memcpy(&resp[24], &resp[16], 8);
+
+                _rtpTimingUdp.beginPacket(_rtpTimingUdp.remoteIP(), _rtpTimingUdp.remotePort());
+                _rtpTimingUdp.write(resp, sizeof(resp));
+                _rtpTimingUdp.endPacket();
+            }
+        }
+    } else if (packetSize > 0) {
+        _rtpTimingUdp.flush();
     }
 }
 
@@ -92,9 +132,11 @@ void AirPlayReceiver::_handleRtspRequests() {
         }
         _rtspClient = newClient;
         _clientConnected = true;
-        _rtspClient.setTimeout(50);
+        _rtspClient.setTimeout(500);
         _clientName = _rtspClient.remoteIP().toString();
         _lastKeepAlive = millis();
+        _clientControlPort = _rtpPort + 1;
+        _clientTimingPort = _rtpPort + 2;
         Serial.printf("[AirPlay] iOS / macOS client connected from %s\n", _clientName.c_str());
     }
 
@@ -105,23 +147,37 @@ void AirPlayReceiver::_handleRtspRequests() {
         if (reqLine.length() > 0) {
             String cseq = "1";
             int contentLength = 0;
-            while (_rtspClient.available()) {
-                String header = _rtspClient.readStringUntil('\n');
-                header.trim();
-                if (header.startsWith("CSeq:")) {
-                    cseq = header.substring(5);
-                    cseq.trim();
-                } else if (header.startsWith("Content-Length:")) {
-                    contentLength = header.substring(15).toInt();
+            String transportHeader = "";
+
+            // Read headers with timeout to protect against TCP segment fragmentation
+            unsigned long headerStart = millis();
+            while (_rtspClient.connected() && (millis() - headerStart < 1500)) {
+                if (_rtspClient.available()) {
+                    String header = _rtspClient.readStringUntil('\n');
+                    header.trim();
+                    if (header.length() == 0) break; // End of RTSP headers
+
+                    String lower = header;
+                    lower.toLowerCase();
+                    if (lower.startsWith("cseq:")) {
+                        cseq = header.substring(5);
+                        cseq.trim();
+                    } else if (lower.startsWith("content-length:")) {
+                        contentLength = header.substring(15).toInt();
+                    } else if (lower.startsWith("transport:")) {
+                        transportHeader = header.substring(10);
+                        transportHeader.trim();
+                    }
+                } else {
+                    delay(2);
                 }
-                if (header.length() == 0) break; // End of RTSP headers
             }
 
             // Read payload body if Content-Length specified
             String body = "";
-            if (contentLength > 0 && contentLength < 4096) {
+            if (contentLength > 0 && contentLength < 8192) {
                 unsigned long tStart = millis();
-                while (contentLength > 0 && (millis() - tStart < 200)) {
+                while (contentLength > 0 && (millis() - tStart < 800)) {
                     if (_rtspClient.available()) {
                         char c = (char)_rtspClient.read();
                         body += c;
@@ -132,23 +188,41 @@ void AirPlayReceiver::_handleRtspRequests() {
                 }
             }
 
-            if (reqLine.startsWith("OPTIONS")) {
+            String cmd = reqLine;
+            int spaceIdx = cmd.indexOf(' ');
+            if (spaceIdx > 0) {
+                cmd = cmd.substring(0, spaceIdx);
+            }
+            cmd.toUpperCase();
+            Serial.printf("[AirPlay RTSP] %s (CSeq %s)\n", cmd.c_str(), cseq.c_str());
+
+            if (cmd == "OPTIONS") {
                 _sendRtspResponse(cseq, "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, SET_PARAMETER, GET_PARAMETER\r\n");
-            } else if (reqLine.startsWith("ANNOUNCE")) {
+            } else if (cmd == "ANNOUNCE") {
                 _sendRtspResponse(cseq);
                 if (_onMeta) _onMeta("AirPlay Audio", _clientName);
-            } else if (reqLine.startsWith("SETUP")) {
-                String transport = "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" + String(_rtpPort) + ";control_port=" + String(_rtpPort + 1) + ";timing_port=" + String(_rtpPort + 2) + "\r\nSession: 12345678\r\nAudio-Jack-Status: connected; type=digital\r\n";
+            } else if (cmd == "SETUP") {
+                int cpIdx = transportHeader.indexOf("control_port=");
+                if (cpIdx >= 0) {
+                    _clientControlPort = transportHeader.substring(cpIdx + 13).toInt();
+                }
+                int tpIdx = transportHeader.indexOf("timing_port=");
+                if (tpIdx >= 0) {
+                    _clientTimingPort = transportHeader.substring(tpIdx + 12).toInt();
+                }
+                String transport = "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" + String(_rtpPort) + 
+                                   ";control_port=" + String(_clientControlPort) + 
+                                   ";timing_port=" + String(_clientTimingPort) + 
+                                   "\r\nSession: 12345678\r\nAudio-Jack-Status: connected; type=digital\r\n";
                 _sendRtspResponse(cseq, transport);
-            } else if (reqLine.startsWith("RECORD")) {
+            } else if (cmd == "RECORD") {
                 _sendRtspResponse(cseq, "Session: 12345678\r\nAudio-Latency: 11025\r\n");
                 if (_onState) _onState(true);
-            } else if (reqLine.startsWith("SET_PARAMETER")) {
-                // Parse volume parameter from body: "volume: -15.000000"
+                Serial.println("[AirPlay] Audio session RECORD active! Streaming started.");
+            } else if (cmd == "SET_PARAMETER") {
                 int vIdx = body.indexOf("volume:");
                 if (vIdx >= 0) {
                     float volDb = body.substring(vIdx + 7).toFloat();
-                    // -30dB (0%) to 0dB (100%), -144dB is mute
                     float volPercent = 0.0f;
                     if (volDb > -100.0f) {
                         volPercent = (volDb + 30.0f) / 30.0f * 100.0f;
@@ -156,13 +230,13 @@ void AirPlayReceiver::_handleRtspRequests() {
                         if (volPercent > 100.0f) volPercent = 100.0f;
                     }
                     if (_onVolume) _onVolume(volPercent);
-                    Serial.printf("[AirPlay] Volume adjusted by client: %.1f dB -> %.0f%%\n", volDb, volPercent);
+                    Serial.printf("[AirPlay] Volume: %.1f dB -> %.0f%%\n", volDb, volPercent);
                 }
                 _sendRtspResponse(cseq);
-            } else if (reqLine.startsWith("FLUSH") || reqLine.startsWith("PAUSE")) {
+            } else if (cmd == "FLUSH" || cmd == "PAUSE") {
                 _sendRtspResponse(cseq, "RTP-Info: seq=0;rtptime=0\r\n");
                 if (_onState) _onState(false);
-            } else if (reqLine.startsWith("TEARDOWN")) {
+            } else if (cmd == "TEARDOWN") {
                 _sendRtspResponse(cseq, "Connection: close\r\n");
                 stop();
             } else {

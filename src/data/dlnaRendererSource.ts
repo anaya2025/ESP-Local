@@ -141,6 +141,7 @@ void DLNARenderer::loop() {
 void DLNARenderer::_sendSsdpAlive() {
     IPAddress ip = WiFi.localIP();
     String location = "http://" + ip.toString() + ":" + String(_port) + "/description.xml";
+    IPAddress bcastIp = WiFi.broadcastIP();
     
     const char* targets[] = {
         "upnp:rootdevice",
@@ -151,19 +152,27 @@ void DLNARenderer::_sendSsdpAlive() {
     };
 
     for (const char* nt : targets) {
-        String msg = "NOTIFY * HTTP/1.1\\r\\n"
-                     "HOST: 239.255.255.250:1900\\r\\n"
-                     "CACHE-CONTROL: max-age=1800\\r\\n"
-                     "LOCATION: " + location + "\\r\\n"
-                     "NT: " + String(nt) + "\\r\\n"
-                     "NTS: ssdp:alive\\r\\n"
-                     "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50\\r\\n"
-                     "USN: uuid:" + _uuid + "::" + String(nt) + "\\r\\n\\r\\n";
+        String msg = "NOTIFY * HTTP/1.1\r\n"
+                     "HOST: 239.255.255.250:1900\r\n"
+                     "CACHE-CONTROL: max-age=1800\r\n"
+                     "LOCATION: " + location + "\r\n"
+                     "NT: " + String(nt) + "\r\n"
+                     "NTS: ssdp:alive\r\n"
+                     "SERVER: Linux/3.0.0 UPnP/1.0 DLNADOC/1.50 Platinum/1.0.4.2\r\n"
+                     "USN: uuid:" + _uuid + "::" + String(nt) + "\r\n\r\n";
 
+        // Multicast
         _ssdpUdp.beginPacket(SSDP_MULTICAST_ADDR, SSDP_MULTICAST_PORT);
         _ssdpUdp.write((const uint8_t*)msg.c_str(), msg.length());
         _ssdpUdp.endPacket();
-        delay(5);
+
+        // Subnet Broadcast to bypass router multicast filtering
+        if (bcastIp != IPAddress(0, 0, 0, 0)) {
+            _ssdpUdp.beginPacket(bcastIp, SSDP_MULTICAST_PORT);
+            _ssdpUdp.write((const uint8_t*)msg.c_str(), msg.length());
+            _ssdpUdp.endPacket();
+        }
+        delay(2);
     }
 }
 
@@ -174,11 +183,11 @@ void DLNARenderer::_sendSsdpBye() {
     };
 
     for (const char* nt : targets) {
-        String msg = "NOTIFY * HTTP/1.1\\r\\n"
-                     "HOST: 239.255.255.250:1900\\r\\n"
-                     "NT: " + String(nt) + "\\r\\n"
-                     "NTS: ssdp:byebye\\r\\n"
-                     "USN: uuid:" + _uuid + "::" + String(nt) + "\\r\\n\\r\\n";
+        String msg = "NOTIFY * HTTP/1.1\r\n"
+                     "HOST: 239.255.255.250:1900\r\n"
+                     "NT: " + String(nt) + "\r\n"
+                     "NTS: ssdp:byebye\r\n"
+                     "USN: uuid:" + _uuid + "::" + String(nt) + "\r\n\r\n";
 
         _ssdpUdp.beginPacket(SSDP_MULTICAST_ADDR, SSDP_MULTICAST_PORT);
         _ssdpUdp.write((const uint8_t*)msg.c_str(), msg.length());
@@ -192,39 +201,48 @@ void DLNARenderer::_handleSsdpSearch() {
         char buf[512];
         int len = _ssdpUdp.read(buf, sizeof(buf) - 1);
         if (len > 0) {
-            buf[len] = '\\0';
+            buf[len] = '\0';
             String req(buf);
-            if (req.startsWith("M-SEARCH")) {
+            String reqUpper = req;
+            reqUpper.toUpperCase();
+
+            if (reqUpper.indexOf("M-SEARCH") >= 0) {
                 auto sendResp = [&](const String& st, const String& usn) {
                     IPAddress ip = WiFi.localIP();
                     String location = "http://" + ip.toString() + ":" + String(_port) + "/description.xml";
-                    String response = "HTTP/1.1 200 OK\\r\\n"
-                                      "CACHE-CONTROL: max-age=1800\\r\\n"
-                                      "DATE: Sun, 01 Jan 2026 00:00:00 GMT\\r\\n"
-                                      "EXT:\\r\\n"
-                                      "LOCATION: " + location + "\\r\\n"
-                                      "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50\\r\\n"
-                                      "ST: " + st + "\\r\\n"
-                                      "USN: " + usn + "\\r\\n\\r\\n";
+                    String response = "HTTP/1.1 200 OK\r\n"
+                                      "CACHE-CONTROL: max-age=1800\r\n"
+                                      "DATE: Sun, 01 Jan 2026 00:00:00 GMT\r\n"
+                                      "EXT:\r\n"
+                                      "LOCATION: " + location + "\r\n"
+                                      "SERVER: Linux/3.0.0 UPnP/1.0 DLNADOC/1.50 Platinum/1.0.4.2\r\n"
+                                      "ST: " + st + "\r\n"
+                                      "USN: " + usn + "\r\n\r\n";
                     _ssdpUdp.beginPacket(_ssdpUdp.remoteIP(), _ssdpUdp.remotePort());
                     _ssdpUdp.write((const uint8_t*)response.c_str(), response.length());
                     _ssdpUdp.endPacket();
+                    delay(2);
                 };
 
-                if (req.indexOf("ssdp:all") > 0) {
+                if (reqUpper.indexOf("SSDP:ALL") >= 0) {
                     sendResp("upnp:rootdevice", "uuid:" + _uuid + "::upnp:rootdevice");
                     sendResp("uuid:" + _uuid, "uuid:" + _uuid);
                     sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
-                } else if (req.indexOf("upnp:rootdevice") > 0) {
-                    sendResp("upnp:rootdevice", "uuid:" + _uuid + "::upnp:rootdevice");
-                } else if (req.indexOf("MediaRenderer") > 0) {
-                    sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
-                } else if (req.indexOf("AVTransport") > 0) {
                     sendResp("urn:schemas-upnp-org:service:AVTransport:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:AVTransport:1");
-                } else if (req.indexOf("RenderingControl") > 0) {
                     sendResp("urn:schemas-upnp-org:service:RenderingControl:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:RenderingControl:1");
-                } else if (req.indexOf("ConnectionManager") > 0) {
                     sendResp("urn:schemas-upnp-org:service:ConnectionManager:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:ConnectionManager:1");
+                } else if (reqUpper.indexOf("UPNP:ROOTDEVICE") >= 0) {
+                    sendResp("upnp:rootdevice", "uuid:" + _uuid + "::upnp:rootdevice");
+                } else if (reqUpper.indexOf("MEDIARENDERER") >= 0) {
+                    sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
+                } else if (reqUpper.indexOf("AVTRANSPORT") >= 0) {
+                    sendResp("urn:schemas-upnp-org:service:AVTransport:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:AVTransport:1");
+                } else if (reqUpper.indexOf("RENDERINGCONTROL") >= 0) {
+                    sendResp("urn:schemas-upnp-org:service:RenderingControl:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:RenderingControl:1");
+                } else if (reqUpper.indexOf("CONNECTIONMANAGER") >= 0) {
+                    sendResp("urn:schemas-upnp-org:service:ConnectionManager:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:service:ConnectionManager:1");
+                } else {
+                    sendResp("urn:schemas-upnp-org:device:MediaRenderer:1", "uuid:" + _uuid + "::urn:schemas-upnp-org:device:MediaRenderer:1");
                 }
             }
         }
@@ -232,11 +250,14 @@ void DLNARenderer::_handleSsdpSearch() {
 }
 
 void DLNARenderer::_registerHttpEndpoints() {
-    _server->on("/description.xml", HTTP_GET, [this]() {
+    auto sendDesc = [this]() {
         _server->sendHeader("Connection", "close");
         _server->sendHeader("Access-Control-Allow-Origin", "*");
-        _server->send(200, "text/xml; charset=\\"utf-8\\"", _getDeviceDescriptionXML());
-    });
+        _server->send(200, "text/xml; charset=\"utf-8\"", _getDeviceDescriptionXML());
+    };
+
+    _server->on("/description.xml", HTTP_GET, sendDesc);
+    _server->on("/upnp/desc.xml", HTTP_GET, sendDesc);
 
     _server->on("/AVTransport/control", HTTP_POST, [this]() {
         String body = _server->arg("plain");
@@ -254,12 +275,12 @@ void DLNARenderer::_registerHttpEndpoints() {
             if (_onStop) _onStop();
         }
 
-        String soapResp = "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\">"
-                          "<s:Body><u:Response xmlns:u=\\"urn:schemas-upnp-org:service:AVTransport:1\\"/>"
+        String soapResp = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+                          "<s:Body><u:Response xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"/>"
                           "</s:Body></s:Envelope>";
         _server->sendHeader("Connection", "close");
         _server->sendHeader("Access-Control-Allow-Origin", "*");
-        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
+        _server->send(200, "text/xml; charset=\"utf-8\"", soapResp);
     });
 
     _server->on("/RenderingControl/control", HTTP_POST, [this]() {
@@ -272,59 +293,61 @@ void DLNARenderer::_registerHttpEndpoints() {
                 if (_onVolume) _onVolume(vol);
             }
         }
-        String soapResp = "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\">"
-                          "<s:Body><u:Response xmlns:u=\\"urn:schemas-upnp-org:service:RenderingControl:1\\"/>"
+        String soapResp = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+                          "<s:Body><u:Response xmlns:u=\"urn:schemas-upnp-org:service:RenderingControl:1\"/>"
                           "</s:Body></s:Envelope>";
         _server->sendHeader("Connection", "close");
         _server->sendHeader("Access-Control-Allow-Origin", "*");
-        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
+        _server->send(200, "text/xml; charset=\"utf-8\"", soapResp);
     });
 
     _server->on("/ConnectionManager/control", HTTP_POST, [this]() {
-        String soapResp = "<?xml version=\\"1.0\\" encoding=\\"utf-8\\"?>\\r\\n"
-                          "<s:Envelope xmlns:s=\\"http://schemas.xmlsoap.org/soap/envelope/\\" s:encodingStyle=\\"http://schemas.xmlsoap.org/soap/encoding/\\">\\r\\n"
-                          "  <s:Body>\\r\\n"
-                          "    <u:GetProtocolInfoResponse xmlns:u=\\"urn:schemas-upnp-org:service:ConnectionManager:1\\">\\r\\n"
-                          "      <Source></Source>\\r\\n"
-                          "      <Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>\\r\\n"
-                          "    </u:GetProtocolInfoResponse>\\r\\n"
-                          "  </s:Body>\\r\\n"
-                          "</s:Envelope>\\r\\n";
+        String soapResp = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
+                          "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n"
+                          "  <s:Body>\r\n"
+                          "    <u:GetProtocolInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">\r\n"
+                          "      <Source></Source>\r\n"
+                          "      <Sink>http-get:*:audio/mpeg:*,http-get:*:audio/mp3:*,http-get:*:audio/x-wav:*,http-get:*:audio/wav:*,http-get:*:audio/aac:*,http-get:*:audio/x-m4a:*,http-get:*:audio/flac:*,http-get:*:*</Sink>\r\n"
+                          "    </u:GetProtocolInfoResponse>\r\n"
+                          "  </s:Body>\r\n"
+                          "</s:Envelope>\r\n";
         _server->sendHeader("Connection", "close");
         _server->sendHeader("Access-Control-Allow-Origin", "*");
-        _server->send(200, "text/xml; charset=\\"utf-8\\"", soapResp);
+        _server->send(200, "text/xml; charset=\"utf-8\"", soapResp);
     });
 }
 
 String DLNARenderer::_getDeviceDescriptionXML() {
     IPAddress ip = WiFi.localIP();
-    String xml = "<?xml version=\\"1.0\\"?>\\n"
-                 "<root xmlns=\\"urn:schemas-upnp-org:device-1-0\\">\\n"
-                 "  <specVersion><major>1</major><minor>0</minor></specVersion>\\n"
-                 "  <device>\\n"
-                 "    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>\\n"
-                 "    <friendlyName>" + _friendlyName + "</friendlyName>\\n"
-                 "    <manufacturer>Espressif</manufacturer>\\n"
-                 "    <modelName>ESP32-S3 N16R8 HiFi</modelName>\\n"
-                 "    <UDN>uuid:" + _uuid + "</UDN>\\n"
-                 "    <serviceList>\\n"
-                 "      <service>\\n"
-                 "        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\\n"
-                 "        <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>\\n"
-                 "        <controlURL>/AVTransport/control</controlURL>\\n"
-                 "      </service>\\n"
-                 "      <service>\\n"
-                 "        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>\\n"
-                 "        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>\\n"
-                 "        <controlURL>/RenderingControl/control</controlURL>\\n"
-                 "      </service>\\n"
-                 "      <service>\\n"
-                 "        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>\\n"
-                 "        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>\\n"
-                 "        <controlURL>/ConnectionManager/control</controlURL>\\n"
-                 "      </service>\\n"
-                 "    </serviceList>\\n"
-                 "  </device>\\n"
+    String xml = "<?xml version=\"1.0\"?>\n"
+                 "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">\n"
+                 "  <specVersion><major>1</major><minor>0</minor></specVersion>\n"
+                 "  <device>\n"
+                 "    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>\n"
+                 "    <friendlyName>" + _friendlyName + "</friendlyName>\n"
+                 "    <manufacturer>Espressif</manufacturer>\n"
+                 "    <modelName>ESP32-S3 N16R8 HiFi</modelName>\n"
+                 "    <UDN>uuid:" + _uuid + "</UDN>\n"
+                 "    <dlna:X_DLNADOC xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">DMR-1.50</dlna:X_DLNADOC>\n"
+                 "    <dlna:X_DLNACAP xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">playcontainer-0-1</dlna:X_DLNACAP>\n"
+                 "    <serviceList>\n"
+                 "      <service>\n"
+                 "        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\n"
+                 "        <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>\n"
+                 "        <controlURL>/AVTransport/control</controlURL>\n"
+                 "      </service>\n"
+                 "      <service>\n"
+                 "        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>\n"
+                 "        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>\n"
+                 "        <controlURL>/RenderingControl/control</controlURL>\n"
+                 "      </service>\n"
+                 "      <service>\n"
+                 "        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>\n"
+                 "        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>\n"
+                 "        <controlURL>/ConnectionManager/control</controlURL>\n"
+                 "      </service>\n"
+                 "    </serviceList>\n"
+                 "  </device>\n"
                  "</root>";
     return xml;
 }
@@ -998,6 +1021,8 @@ private:
     bool _clientConnected;
     String _clientName;
     unsigned long _lastKeepAlive;
+    uint16_t _clientControlPort;
+    uint16_t _clientTimingPort;
 
     AudioPcmCallback _onAudioPcm;
     StreamMetaCallback _onMeta;
@@ -1006,6 +1031,7 @@ private:
 
     void _handleRtspRequests();
     void _handleRtpAudio();
+    void _handleRtpTiming();
     void _sendRtspResponse(const String& cseq, const String& extraHeaders = "");
 };
 `;
@@ -1033,9 +1059,9 @@ bool AirPlayReceiver::begin(const char* deviceName, uint16_t rtspPort, uint16_t 
     _rtpPort = rtpPort;
 
     _rtspServer.begin(_rtspPort);
-    _rtpUdp.begin(_rtpPort);           // Port 6000: RTP Audio (PCM samples)
-    _rtpControlUdp.begin(_rtpPort + 1); // Port 6001: RTP Control
-    _rtpTimingUdp.begin(_rtpPort + 2);  // Port 6002: RTP Timing
+    _rtpUdp.begin(_rtpPort);             // Port 6000: RTP Audio (PCM samples)
+    _rtpControlUdp.begin(_rtpPort + 1);   // Port 6001: RTP Control
+    _rtpTimingUdp.begin(_rtpPort + 2);    // Port 6002: RTP Timing
 
     announceBonjour();
     Serial.printf("[AirPlay] RAOP Receiver listening on RTSP port %d, RTP audio ports %d-%d\\n", _rtspPort, _rtpPort, _rtpPort + 2);
@@ -1050,7 +1076,7 @@ void AirPlayReceiver::announceBonjour() {
     char macColonStr[18];
     snprintf(macColonStr, sizeof(macColonStr), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    // Service name standard for AirPlay audio: MAC@DeviceName
+    // Apple AirPlay RAOP service name strictly requires: MAC@DeviceName
     String raopServiceName = String(macStr) + "@" + _deviceName;
 
     // Helper lambda using explicit String types to avoid overload ambiguity in ESPmDNS.h
@@ -1060,53 +1086,76 @@ void AirPlayReceiver::announceBonjour() {
 
     // Announce _raop._tcp on port 5000: Unencrypted 16-bit 44.1kHz Stereo PCM
     MDNS.addService("raop", "tcp", _rtspPort);
-    MDNS.setInstanceName(raopServiceName);
+    MDNS.setInstanceName(raopServiceName.c_str());
     mdns_service_instance_name_set("_raop", "_tcp", raopServiceName.c_str());
 
     addTxt("raop", "tcp", "tp", "UDP");
     addTxt("raop", "tcp", "sm", "false");
     addTxt("raop", "tcp", "sv", "false");
-    addTxt("raop", "tcp", "ek", "0");       // 0 = No encryption key needed
-    addTxt("raop", "tcp", "et", "0,1");     // 0 = Unencrypted stream (standard RAOP)
-    addTxt("raop", "tcp", "cn", "0,1");     // 0 = Linear 16-bit PCM, 1 = ALAC
-    addTxt("raop", "tcp", "ch", "2");       // 2 = Stereo channels
-    addTxt("raop", "tcp", "ss", "16");      // 16 = 16-bit sample size
-    addTxt("raop", "tcp", "sr", "44100");   // 44.1 kHz sample rate
+    addTxt("raop", "tcp", "ek", "0");         // 0 = No encryption key needed
+    addTxt("raop", "tcp", "et", "0");         // 0 = STRICTLY unencrypted stream (prevents iOS FairPlay / RSA failure)
+    addTxt("raop", "tcp", "cn", "0,1");       // 0 = Linear 16-bit PCM, 1 = ALAC
+    addTxt("raop", "tcp", "ch", "2");         // 2 = Stereo channels
+    addTxt("raop", "tcp", "ss", "16");        // 16 = 16-bit sample size
+    addTxt("raop", "tcp", "sr", "44100");     // 44.1 kHz sample rate
     addTxt("raop", "tcp", "vn", "65537");
     addTxt("raop", "tcp", "txtvers", "1");
     addTxt("raop", "tcp", "da", "true");
-    addTxt("raop", "tcp", "md", "0,1,2");
+    addTxt("raop", "tcp", "md", "0");         // 0 = unencrypted audio
     addTxt("raop", "tcp", "pw", "false");
 
-    // Announce _airplay._tcp on port 5000: Standard AppleTV/Airport audio target
-    MDNS.addService("airplay", "tcp", _rtspPort);
-    mdns_service_instance_name_set("_airplay", "_tcp", _deviceName.c_str());
-
-    addTxt("airplay", "tcp", "model", "AppleTV2,1");
-    addTxt("airplay", "tcp", "srcvers", "220.68");
-    addTxt("airplay", "tcp", "features", "0x7");
-    addTxt("airplay", "tcp", "flags", "0x4");
-    addTxt("airplay", "tcp", "deviceid", String(macColonStr));
-    addTxt("airplay", "tcp", "acl", "0");
-    addTxt("airplay", "tcp", "pw", "false");
-
-    Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s)\\n", raopServiceName.c_str(), macColonStr);
+    Serial.printf("[AirPlay] AirPlay Bonjour announced: %s (%s) on port %d\\n", raopServiceName.c_str(), macColonStr, _rtspPort);
 }
 
 void AirPlayReceiver::loop() {
     _handleRtspRequests();
     _handleRtpAudio();
+    _handleRtpTiming();
 
-    // Drain control and timing sockets to keep network buffers clean
+    // Drain control socket to keep network buffers clean
     if (_rtpControlUdp.parsePacket() > 0) {
         _rtpControlUdp.flush();
-    }
-    if (_rtpTimingUdp.parsePacket() > 0) {
-        _rtpTimingUdp.flush();
     }
 
     if (_clientConnected && (!_rtspClient || !_rtspClient.connected())) {
         stop();
+    }
+}
+
+void AirPlayReceiver::_handleRtpTiming() {
+    int packetSize = _rtpTimingUdp.parsePacket();
+    if (packetSize >= 32) {
+        uint8_t req[32];
+        int len = _rtpTimingUdp.read(req, sizeof(req));
+        if (len >= 32) {
+            uint8_t pt = req[1] & 0x7F;
+            if (pt == 0x52 || pt == 0x02 || (req[1] == 0xD2) || (req[1] == 0x82)) {
+                uint8_t resp[32];
+                memset(resp, 0, sizeof(resp));
+                resp[0] = 0x80;
+                resp[1] = 0x53; // Timing reply payload type
+                resp[2] = req[2]; // Echo sequence number
+                resp[3] = req[3];
+                memcpy(&resp[8], &req[24], 8);
+
+                uint64_t nowUs = (uint64_t)esp_timer_get_time();
+                uint32_t sec = (uint32_t)(nowUs / 1000000ULL);
+                uint32_t frac = (uint32_t)(((nowUs % 1000000ULL) * 4294967296ULL) / 1000000ULL);
+
+                resp[16] = (sec >> 24) & 0xFF; resp[17] = (sec >> 16) & 0xFF;
+                resp[18] = (sec >> 8) & 0xFF;  resp[19] = sec & 0xFF;
+                resp[20] = (frac >> 24) & 0xFF; resp[21] = (frac >> 16) & 0xFF;
+                resp[22] = (frac >> 8) & 0xFF;  resp[23] = frac & 0xFF;
+
+                memcpy(&resp[24], &resp[16], 8);
+
+                _rtpTimingUdp.beginPacket(_rtpTimingUdp.remoteIP(), _rtpTimingUdp.remotePort());
+                _rtpTimingUdp.write(resp, sizeof(resp));
+                _rtpTimingUdp.endPacket();
+            }
+        }
+    } else if (packetSize > 0) {
+        _rtpTimingUdp.flush();
     }
 }
 
@@ -1118,10 +1167,12 @@ void AirPlayReceiver::_handleRtspRequests() {
         }
         _rtspClient = newClient;
         _clientConnected = true;
-        _rtspClient.setTimeout(50);
+        _rtspClient.setTimeout(500);
         _clientName = _rtspClient.remoteIP().toString();
+        _lastKeepAlive = millis();
+        _clientControlPort = _rtpPort + 1;
+        _clientTimingPort = _rtpPort + 2;
         Serial.printf("[AirPlay] iOS / macOS client connected from %s\\n", _clientName.c_str());
-        if (_onState) _onState(true);
     }
 
     if (_rtspClient && _rtspClient.available()) {
@@ -1131,23 +1182,35 @@ void AirPlayReceiver::_handleRtspRequests() {
         if (reqLine.length() > 0) {
             String cseq = "1";
             int contentLength = 0;
-            while (_rtspClient.available()) {
-                String header = _rtspClient.readStringUntil('\\n');
-                header.trim();
-                if (header.startsWith("CSeq:")) {
-                    cseq = header.substring(5);
-                    cseq.trim();
-                } else if (header.startsWith("Content-Length:")) {
-                    contentLength = header.substring(15).toInt();
+            String transportHeader = "";
+
+            unsigned long headerStart = millis();
+            while (_rtspClient.connected() && (millis() - headerStart < 1500)) {
+                if (_rtspClient.available()) {
+                    String header = _rtspClient.readStringUntil('\\n');
+                    header.trim();
+                    if (header.length() == 0) break;
+
+                    String lower = header;
+                    lower.toLowerCase();
+                    if (lower.startsWith("cseq:")) {
+                        cseq = header.substring(5);
+                        cseq.trim();
+                    } else if (lower.startsWith("content-length:")) {
+                        contentLength = header.substring(15).toInt();
+                    } else if (lower.startsWith("transport:")) {
+                        transportHeader = header.substring(10);
+                        transportHeader.trim();
+                    }
+                } else {
+                    delay(2);
                 }
-                if (header.length() == 0) break; // End of RTSP headers
             }
 
-            // Read payload body if Content-Length specified
             String body = "";
-            if (contentLength > 0 && contentLength < 4096) {
+            if (contentLength > 0 && contentLength < 8192) {
                 unsigned long tStart = millis();
-                while (contentLength > 0 && (millis() - tStart < 200)) {
+                while (contentLength > 0 && (millis() - tStart < 800)) {
                     if (_rtspClient.available()) {
                         char c = (char)_rtspClient.read();
                         body += c;
@@ -1158,23 +1221,41 @@ void AirPlayReceiver::_handleRtspRequests() {
                 }
             }
 
-            if (reqLine.startsWith("OPTIONS")) {
+            String cmd = reqLine;
+            int spaceIdx = cmd.indexOf(' ');
+            if (spaceIdx > 0) {
+                cmd = cmd.substring(0, spaceIdx);
+            }
+            cmd.toUpperCase();
+            Serial.printf("[AirPlay RTSP] %s (CSeq %s)\\n", cmd.c_str(), cseq.c_str());
+
+            if (cmd == "OPTIONS") {
                 _sendRtspResponse(cseq, "Public: ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, SET_PARAMETER, GET_PARAMETER\\r\\n");
-            } else if (reqLine.startsWith("ANNOUNCE")) {
+            } else if (cmd == "ANNOUNCE") {
                 _sendRtspResponse(cseq);
                 if (_onMeta) _onMeta("AirPlay Audio", _clientName);
-            } else if (reqLine.startsWith("SETUP")) {
-                String transport = "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" + String(_rtpPort) + ";control_port=" + String(_rtpPort + 1) + ";timing_port=" + String(_rtpPort + 2) + "\\r\\nSession: 12345678\\r\\nAudio-Jack-Status: connected; type=digital\\r\\n";
+            } else if (cmd == "SETUP") {
+                int cpIdx = transportHeader.indexOf("control_port=");
+                if (cpIdx >= 0) {
+                    _clientControlPort = transportHeader.substring(cpIdx + 13).toInt();
+                }
+                int tpIdx = transportHeader.indexOf("timing_port=");
+                if (tpIdx >= 0) {
+                    _clientTimingPort = transportHeader.substring(tpIdx + 12).toInt();
+                }
+                String transport = "Transport: RTP/AVP/UDP;unicast;mode=record;server_port=" + String(_rtpPort) + 
+                                   ";control_port=" + String(_clientControlPort) + 
+                                   ";timing_port=" + String(_clientTimingPort) + 
+                                   "\\r\\nSession: 12345678\\r\\nAudio-Jack-Status: connected; type=digital\\r\\n";
                 _sendRtspResponse(cseq, transport);
-            } else if (reqLine.startsWith("RECORD")) {
+            } else if (cmd == "RECORD") {
                 _sendRtspResponse(cseq, "Session: 12345678\\r\\nAudio-Latency: 11025\\r\\n");
                 if (_onState) _onState(true);
-            } else if (reqLine.startsWith("SET_PARAMETER")) {
-                // Parse volume parameter from body: "volume: -15.000000"
+                Serial.println("[AirPlay] Audio session RECORD active! Streaming started.");
+            } else if (cmd == "SET_PARAMETER") {
                 int vIdx = body.indexOf("volume:");
                 if (vIdx >= 0) {
                     float volDb = body.substring(vIdx + 7).toFloat();
-                    // -30dB (0%) to 0dB (100%), -144dB is mute
                     float volPercent = 0.0f;
                     if (volDb > -100.0f) {
                         volPercent = (volDb + 30.0f) / 30.0f * 100.0f;
@@ -1182,13 +1263,13 @@ void AirPlayReceiver::_handleRtspRequests() {
                         if (volPercent > 100.0f) volPercent = 100.0f;
                     }
                     if (_onVolume) _onVolume(volPercent);
-                    Serial.printf("[AirPlay] Volume adjusted by client: %.1f dB -> %.0f%%\\n", volDb, volPercent);
+                    Serial.printf("[AirPlay] Volume: %.1f dB -> %.0f%%\\n", volDb, volPercent);
                 }
                 _sendRtspResponse(cseq);
-            } else if (reqLine.startsWith("FLUSH") || reqLine.startsWith("PAUSE")) {
+            } else if (cmd == "FLUSH" || cmd == "PAUSE") {
                 _sendRtspResponse(cseq, "RTP-Info: seq=0;rtptime=0\\r\\n");
                 if (_onState) _onState(false);
-            } else if (reqLine.startsWith("TEARDOWN")) {
+            } else if (cmd == "TEARDOWN") {
                 _sendRtspResponse(cseq, "Connection: close\\r\\n");
                 stop();
             } else {
@@ -1201,11 +1282,10 @@ void AirPlayReceiver::_handleRtspRequests() {
 void AirPlayReceiver::_handleRtpAudio() {
     int packetSize = _rtpUdp.parsePacket();
     while (packetSize > 0) {
-        if (packetSize > 12) { // Standard RTP header is 12 bytes
+        if (packetSize > 12) {
             uint8_t buffer[1472];
             int len = _rtpUdp.read(buffer, sizeof(buffer));
             if (len > 12 && _onAudioPcm) {
-                // In uncompressed PCM RAOP (cn=0), bytes 12..end are raw 16-bit 44.1kHz stereo PCM
                 _onAudioPcm(&buffer[12], len - 12);
             }
         } else {

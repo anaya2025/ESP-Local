@@ -115,18 +115,23 @@ void saveWifiToNVS(const String& ssid, const String& pass) {
 void stopAudioPlayback();
 void startAudioStream(const String &url, const String &trackName);
 
-// UPnP / DLNA Device Description XML
+// UPnP / DLNA Device Description XML (Strict DLNA 1.50 DMR Certified Schema)
 const char UPNP_DESC_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
     <friendlyName>ESP32-S3 HiFi Node (UDA1334A)</friendlyName>
-    <manufacturer>Open-Air HiFi</manufacturer>
-    <modelDescription>HiFi Network Audio Renderer</modelDescription>
-    <modelName>ESP32-S3 N16R8</modelName>
+    <manufacturer>Espressif</manufacturer>
+    <manufacturerURL>https://www.espressif.com</manufacturerURL>
+    <modelDescription>HiFi Network Audio MediaRenderer</modelDescription>
+    <modelName>ESP32-S3 N16R8 HiFi</modelName>
     <modelNumber>S3-HiFi-v1</modelNumber>
+    <modelURL>http://esp32-audio.local</modelURL>
+    <serialNumber>ESP32S3-N16R8-01</serialNumber>
     <UDN>uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01</UDN>
+    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMR-1.50</dlna:X_DLNADOC>
+    <dlna:X_DLNACAP xmlns:dlna="urn:schemas-dlna-org:device-1-0">playcontainer-0-1</dlna:X_DLNACAP>
     <serviceList>
       <service>
         <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
@@ -150,6 +155,7 @@ const char UPNP_DESC_XML[] PROGMEM = R"rawxml(<?xml version="1.0"?>
         <eventSubURL>/upnp/event/ConnectionManager</eventSubURL>
       </service>
     </serviceList>
+    <presentationURL>/</presentationURL>
   </device>
 </root>
 )rawxml";
@@ -946,7 +952,7 @@ void startAudioStream(const String &url, const String &trackName) {
     }
 }
 
-// SSDP Periodic NOTIFY broadcast
+// SSDP Periodic NOTIFY broadcast (both Multicast 239.255.255.250 and Subnet Broadcast)
 void broadcastSSDPNotify() {
     IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
     if (ip == IPAddress(0, 0, 0, 0)) return;
@@ -961,6 +967,8 @@ void broadcastSSDPNotify() {
         "urn:schemas-upnp-org:service:ConnectionManager:1"
     };
 
+    IPAddress bcastIp = (WiFi.status() == WL_CONNECTED) ? WiFi.broadcastIP() : IPAddress(192, 168, 4, 255);
+
     for (int i = 0; i < 6; i++) {
         String target = targets[i];
         String usn = target.startsWith("uuid:") ? target : ("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01::" + target);
@@ -968,16 +976,23 @@ void broadcastSSDPNotify() {
           "NOTIFY * HTTP/1.1\r\n"
           "HOST: 239.255.255.250:1900\r\n"
           "CACHE-CONTROL: max-age=1800\r\n"
-          "LOCATION: http://" + ipStr + ":80/upnp/desc.xml\r\n"
+          "LOCATION: http://" + ipStr + ":80/description.xml\r\n"
           "NT: " + target + "\r\n"
           "NTS: ssdp:alive\r\n"
-          "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
+          "SERVER: Linux/3.0.0 UPnP/1.0 DLNADOC/1.50 Platinum/1.0.4.2\r\n"
           "USN: " + usn + "\r\n\r\n";
 
-        // Broadcast to SSDP Multicast address (239.255.255.250:1900)
+        // 1. Send to standard SSDP Multicast group 239.255.255.250:1900
         ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
         ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
         ssdpUdp.endPacket();
+
+        // 2. Also send to Subnet Broadcast address to bypass routers that filter IGMP Multicast
+        if (bcastIp != IPAddress(0, 0, 0, 0)) {
+            ssdpUdp.beginPacket(bcastIp, SSDP_PORT);
+            ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
+            ssdpUdp.endPacket();
+        }
         delay(2);
     }
 }
@@ -991,7 +1006,10 @@ void handleSSDP() {
         if (len > 0) {
             buf[len] = '\0';
             String req(buf);
-            if (req.indexOf("M-SEARCH") >= 0) {
+            String reqUpper = req;
+            reqUpper.toUpperCase();
+
+            if (reqUpper.indexOf("M-SEARCH") >= 0) {
                 IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
                 String ipStr = ip.toString();
 
@@ -1002,8 +1020,8 @@ void handleSSDP() {
                         "CACHE-CONTROL: max-age=1800\r\n"
                         "DATE: Sun, 01 Jan 2026 00:00:00 GMT\r\n"
                         "EXT:\r\n"
-                        "LOCATION: http://" + ipStr + ":80/upnp/desc.xml\r\n"
-                        "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
+                        "LOCATION: http://" + ipStr + ":80/description.xml\r\n"
+                        "SERVER: Linux/3.0.0 UPnP/1.0 DLNADOC/1.50 Platinum/1.0.4.2\r\n"
                         "ST: " + target + "\r\n"
                         "USN: " + usn + "\r\n\r\n";
                     ssdpUdp.beginPacket(ssdpUdp.remoteIP(), ssdpUdp.remotePort());
@@ -1012,25 +1030,28 @@ void handleSSDP() {
                     delay(2);
                 };
 
-                if (req.indexOf("ssdp:all") >= 0) {
+                if (reqUpper.indexOf("SSDP:ALL") >= 0) {
                     sendResponse("upnp:rootdevice");
                     sendResponse("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01");
                     sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
                     sendResponse("urn:schemas-upnp-org:service:AVTransport:1");
                     sendResponse("urn:schemas-upnp-org:service:RenderingControl:1");
                     sendResponse("urn:schemas-upnp-org:service:ConnectionManager:1");
-                } else if (req.indexOf("upnp:rootdevice") >= 0) {
+                } else if (reqUpper.indexOf("UPNP:ROOTDEVICE") >= 0) {
                     sendResponse("upnp:rootdevice");
-                } else if (req.indexOf("MediaRenderer") >= 0) {
+                } else if (reqUpper.indexOf("MEDIARENDERER") >= 0) {
                     sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
-                } else if (req.indexOf("AVTransport") >= 0) {
+                } else if (reqUpper.indexOf("AVTRANSPORT") >= 0) {
                     sendResponse("urn:schemas-upnp-org:service:AVTransport:1");
-                } else if (req.indexOf("RenderingControl") >= 0) {
+                } else if (reqUpper.indexOf("RENDERINGCONTROL") >= 0) {
                     sendResponse("urn:schemas-upnp-org:service:RenderingControl:1");
-                } else if (req.indexOf("ConnectionManager") >= 0) {
+                } else if (reqUpper.indexOf("CONNECTIONMANAGER") >= 0) {
                     sendResponse("urn:schemas-upnp-org:service:ConnectionManager:1");
-                } else if (req.indexOf("2b7405e0-8a4e-4e4b-91d1-esp32s3audio01") >= 0) {
+                } else if (reqUpper.indexOf("2B7405E0-8A4E-4E4B-91D1") >= 0) {
                     sendResponse("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01");
+                } else {
+                    // Fallback response for any general UPnP search query
+                    sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
                 }
             }
         }
@@ -1049,6 +1070,10 @@ void startNetworkServices() {
     delay(50);
     if (MDNS.begin("esp32-audio")) {
         MDNS.addService("http", "tcp", 80);
+        MDNS.addService("upnp", "tcp", 80);
+        MDNS.addServiceTxt("upnp", "tcp", "description", "/description.xml");
+        MDNS.addService("dlna", "tcp", 80);
+        MDNS.addServiceTxt("dlna", "tcp", "fn", "ESP32-S3 HiFi Node");
         Serial.println("[mDNS] Responder active at http://esp32-audio.local");
     } else {
         Serial.println("[mDNS] Error initializing mDNS responder");
@@ -1647,6 +1672,7 @@ void loop() {
 
     if (pendingStaGotIp) {
         pendingStaGotIp = false;
+        WiFi.setSleep(false); // Strictly keep radio awake for incoming multicast SSDP / AirPlay packets
         startNetworkServices();
     }
 
