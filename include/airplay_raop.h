@@ -25,6 +25,7 @@ public:
 
     AirPlayReceiver();
     bool begin(const char* deviceName, uint16_t rtspPort = 5000, uint16_t rtpPort = 6000);
+    void announceBonjour();
     void loop();
     void stop();
 
@@ -55,7 +56,6 @@ private:
     VolumeCallback _onVolume;
     StateCallback _onState;
 
-    void _announceBonjour();
     void _handleRtspRequests();
     void _handleRtpAudio();
     void _sendRtspResponse(const String& cseq, const String& extraHeaders = "");

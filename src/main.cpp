@@ -964,9 +964,17 @@ void broadcastSSDPNotify() {
           "SERVER: ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0\r\n"
           "USN: " + usn + "\r\n\r\n";
 
-        ssdpUdp.beginPacket(SSDP_MULTICAST_IP, SSDP_PORT);
+        // Multicast to Station interface (home Wi-Fi network)
+        if (WiFi.status() == WL_CONNECTED) {
+            ssdpUdp.beginPacketMulticast(SSDP_MULTICAST_IP, SSDP_PORT, WiFi.localIP(), 4);
+            ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
+            ssdpUdp.endPacket();
+        }
+        // Multicast to SoftAP interface
+        ssdpUdp.beginPacketMulticast(SSDP_MULTICAST_IP, SSDP_PORT, WiFi.softAPIP(), 4);
         ssdpUdp.write((const uint8_t*)notifyMsg.c_str(), notifyMsg.length());
         ssdpUdp.endPacket();
+        delay(2);
     }
 }
 
@@ -997,12 +1005,16 @@ void handleSSDP() {
                     ssdpUdp.beginPacket(ssdpUdp.remoteIP(), ssdpUdp.remotePort());
                     ssdpUdp.write((const uint8_t*)response.c_str(), response.length());
                     ssdpUdp.endPacket();
+                    delay(2);
                 };
 
                 if (req.indexOf("ssdp:all") >= 0) {
                     sendResponse("upnp:rootdevice");
                     sendResponse("uuid:2b7405e0-8a4e-4e4b-91d1-esp32s3audio01");
                     sendResponse("urn:schemas-upnp-org:device:MediaRenderer:1");
+                    sendResponse("urn:schemas-upnp-org:service:AVTransport:1");
+                    sendResponse("urn:schemas-upnp-org:service:RenderingControl:1");
+                    sendResponse("urn:schemas-upnp-org:service:ConnectionManager:1");
                 } else if (req.indexOf("upnp:rootdevice") >= 0) {
                     sendResponse("upnp:rootdevice");
                 } else if (req.indexOf("MediaRenderer") >= 0) {
@@ -1019,6 +1031,40 @@ void handleSSDP() {
             }
         }
     }
+}
+
+// Re-registers and starts all network discovery services across the active interface
+void startNetworkServices() {
+    IPAddress ip = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP() : WiFi.softAPIP();
+    Serial.println("\n[NET] ========================================================");
+    Serial.printf("[NET] Starting Discovery & Streaming Services for IP: %s (STA: %s)\n",
+                  ip.toString().c_str(), (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "SOFTAP ONLY");
+
+    // 1. Restart mDNS Responder (http://esp32-audio.local)
+    MDNS.end();
+    delay(50);
+    if (MDNS.begin("esp32-audio")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("[mDNS] Responder active at http://esp32-audio.local");
+    } else {
+        Serial.println("[mDNS] Error initializing mDNS responder");
+    }
+
+    // 2. Announce AirPlay 1/2 RAOP via mDNS Bonjour
+    airplay.announceBonjour();
+
+    // 3. Re-bind SSDP Multicast UDP socket (239.255.255.250:1900)
+    ssdpUdp.stop();
+    delay(50);
+    if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
+        Serial.println("[SSDP] Multicast listening on 239.255.255.250:1900");
+    } else {
+        Serial.println("[SSDP] Error binding SSDP multicast port 1900");
+    }
+
+    // 4. Send initial SSDP alive announcement bursts
+    broadcastSSDPNotify();
+    Serial.println("[NET] ========================================================\n");
 }
 
 void setup() {
@@ -1103,17 +1149,18 @@ void setup() {
     if (savedSsid.length() > 0) {
         Serial.printf("[WIFI] Auto-connecting to saved network: %s\n", savedSsid.c_str());
         WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-    }
-
-    // mDNS Responder: http://esp32-audio.local
-    if (MDNS.begin("esp32-audio")) {
-        MDNS.addService("http", "tcp", 80);
-        Serial.println("[mDNS] Responder started: http://esp32-audio.local");
-    }
-
-    // SSDP UDP multicast
-    if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
-        Serial.println("[SSDP] Multicast listening on 239.255.255.250:1900");
+        Serial.print("[WIFI] Waiting for connection");
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 5000) {
+            delay(100);
+            Serial.print(".");
+        }
+        Serial.println();
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[WIFI] Connected! Station IP: %s\n", WiFi.localIP().toString().c_str());
+        } else {
+            Serial.println("[WIFI] Connecting in background...");
+        }
     }
 
     // Web Server Endpoints
@@ -1122,6 +1169,13 @@ void setup() {
     });
 
     server.on("/upnp/desc.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
+        response->addHeader("Connection", "close");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    });
+
+    server.on("/description.xml", HTTP_GET, [](AsyncWebServerRequest *request) {
         AsyncWebServerResponse *response = request->beginResponse_P(200, "text/xml; charset=\"utf-8\"", (const uint8_t*)UPNP_DESC_XML, strlen_P(UPNP_DESC_XML));
         response->addHeader("Connection", "close");
         response->addHeader("Access-Control-Allow-Origin", "*");
@@ -1461,6 +1515,33 @@ void setup() {
         }
       });
 
+    // UPnP GENA EventSub endpoints (returns 200 OK with SID and TIMEOUT for DLNA controllers)
+    auto handleEventSub = [](AsyncWebServerRequest *request) {
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "");
+        response->addHeader("SERVER", "ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0");
+        response->addHeader("SID", "uuid:2b7405e0-8a4e-4e4b-91d1-sub01");
+        response->addHeader("TIMEOUT", "Second-1800");
+        response->addHeader("Access-Control-Allow-Origin", "*");
+        request->send(response);
+    };
+
+    server.on("/upnp/event/AVTransport", HTTP_ANY, handleEventSub);
+    server.on("/upnp/event/RenderingControl", HTTP_ANY, handleEventSub);
+    server.on("/upnp/event/ConnectionManager", HTTP_ANY, handleEventSub);
+
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        if (request->url().indexOf("event") >= 0) {
+            AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", "");
+            response->addHeader("SERVER", "ESP32-S3/1.0 UPnP/1.0 DLNADOC/1.50 Open-Air/1.0");
+            response->addHeader("SID", "uuid:2b7405e0-8a4e-4e4b-91d1-sub01");
+            response->addHeader("TIMEOUT", "Second-1800");
+            response->addHeader("Access-Control-Allow-Origin", "*");
+            request->send(response);
+            return;
+        }
+        request->send(404, "text/plain", "Not Found");
+    });
+
     server.begin();
     Serial.println("[HTTP] Server started on port 80");
 
@@ -1507,18 +1588,14 @@ void setup() {
     });
 
     airplay.begin("ESP32-S3 HiFi Node", 5000, 6000);
-    broadcastSSDPNotify();
+    startNetworkServices();
     Serial.println("[SYS] System initialized and ready!");
 }
 
 void loop() {
     if (pendingStaGotIp) {
         pendingStaGotIp = false;
-        ssdpUdp.stop();
-        if (ssdpUdp.beginMulticast(SSDP_MULTICAST_IP, SSDP_PORT)) {
-            Serial.println("[SSDP] Multicast re-bound on STA interface 239.255.255.250:1900");
-        }
-        broadcastSSDPNotify();
+        startNetworkServices();
     }
 
     if (activeDecoder && activeDecoder->isRunning()) {

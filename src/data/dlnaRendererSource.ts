@@ -973,6 +973,7 @@ public:
 
     AirPlayReceiver();
     bool begin(const char* deviceName, uint16_t rtspPort = 5000, uint16_t rtpPort = 6000);
+    void announceBonjour();
     void loop();
     void stop();
 
@@ -1003,7 +1004,6 @@ private:
     VolumeCallback _onVolume;
     StateCallback _onState;
 
-    void _announceBonjour();
     void _handleRtspRequests();
     void _handleRtpAudio();
     void _sendRtspResponse(const String& cseq, const String& extraHeaders = "");
@@ -1018,6 +1018,8 @@ export function getAirPlayReceiverCpp(): string {
  */
 
 #include "airplay_raop.h"
+#include <ESPmDNS.h>
+#include <mdns.h>
 
 AirPlayReceiver::AirPlayReceiver()
     : _rtspPort(5000), _rtpPort(6000), _rtspServer(5000), _clientConnected(false),
@@ -1035,12 +1037,12 @@ bool AirPlayReceiver::begin(const char* deviceName, uint16_t rtspPort, uint16_t 
     _rtpControlUdp.begin(_rtpPort + 1); // Port 6001: RTP Control
     _rtpTimingUdp.begin(_rtpPort + 2);  // Port 6002: RTP Timing
 
-    _announceBonjour();
+    announceBonjour();
     Serial.printf("[AirPlay] RAOP Receiver listening on RTSP port %d, RTP audio ports %d-%d\\n", _rtspPort, _rtpPort, _rtpPort + 2);
     return true;
 }
 
-void AirPlayReceiver::_announceBonjour() {
+void AirPlayReceiver::announceBonjour() {
     uint8_t mac[6];
     WiFi.macAddress(mac);
     char macStr[18];
@@ -1057,14 +1059,16 @@ void AirPlayReceiver::_announceBonjour() {
     };
 
     // Announce _raop._tcp on port 5000: Unencrypted 16-bit 44.1kHz Stereo PCM
-    // Setting et=0, ek=0, cn=0 instructs iOS / macOS to stream raw unencrypted linear PCM without RSA/AES keys!
     MDNS.addService("raop", "tcp", _rtspPort);
+    MDNS.setInstanceName(raopServiceName);
+    mdns_service_instance_name_set("_raop", "_tcp", raopServiceName.c_str());
+
     addTxt("raop", "tcp", "tp", "UDP");
     addTxt("raop", "tcp", "sm", "false");
     addTxt("raop", "tcp", "sv", "false");
     addTxt("raop", "tcp", "ek", "0");       // 0 = No encryption key needed
-    addTxt("raop", "tcp", "et", "0");       // 0 = Unencrypted stream (standard RAOP)
-    addTxt("raop", "tcp", "cn", "0");       // 0 = Linear 16-bit PCM (no ALAC compression)
+    addTxt("raop", "tcp", "et", "0,1");     // 0 = Unencrypted stream (standard RAOP)
+    addTxt("raop", "tcp", "cn", "0,1");     // 0 = Linear 16-bit PCM, 1 = ALAC
     addTxt("raop", "tcp", "ch", "2");       // 2 = Stereo channels
     addTxt("raop", "tcp", "ss", "16");      // 16 = 16-bit sample size
     addTxt("raop", "tcp", "sr", "44100");   // 44.1 kHz sample rate
@@ -1074,9 +1078,10 @@ void AirPlayReceiver::_announceBonjour() {
     addTxt("raop", "tcp", "md", "0,1,2");
     addTxt("raop", "tcp", "pw", "false");
 
-    // Announce _airplay._tcp on port 5000: Standard AppleTV/Airport audio target (features 0x7 for audio playback)
-    // Avoids 0x5A7FFFF7 which forces AirPlay 2 HomeKit Pair-Verify (Curve25519/SRP6a)
+    // Announce _airplay._tcp on port 5000: Standard AppleTV/Airport audio target
     MDNS.addService("airplay", "tcp", _rtspPort);
+    mdns_service_instance_name_set("_airplay", "_tcp", _deviceName.c_str());
+
     addTxt("airplay", "tcp", "model", "AppleTV2,1");
     addTxt("airplay", "tcp", "srcvers", "220.68");
     addTxt("airplay", "tcp", "features", "0x7");
@@ -1106,15 +1111,17 @@ void AirPlayReceiver::loop() {
 }
 
 void AirPlayReceiver::_handleRtspRequests() {
-    if (!_rtspClient || !_rtspClient.connected()) {
-        _rtspClient = _rtspServer.available();
-        if (_rtspClient) {
-            _clientConnected = true;
-            _rtspClient.setTimeout(20);
-            _clientName = _rtspClient.remoteIP().toString();
-            Serial.printf("[AirPlay] iOS / macOS client connected from %s\\n", _clientName.c_str());
-            if (_onState) _onState(true);
+    WiFiClient newClient = _rtspServer.available();
+    if (newClient) {
+        if (_rtspClient && _rtspClient.connected() && _rtspClient.remoteIP() != newClient.remoteIP()) {
+            _rtspClient.stop();
         }
+        _rtspClient = newClient;
+        _clientConnected = true;
+        _rtspClient.setTimeout(50);
+        _clientName = _rtspClient.remoteIP().toString();
+        Serial.printf("[AirPlay] iOS / macOS client connected from %s\\n", _clientName.c_str());
+        if (_onState) _onState(true);
     }
 
     if (_rtspClient && _rtspClient.available()) {
@@ -1139,10 +1146,15 @@ void AirPlayReceiver::_handleRtspRequests() {
             // Read payload body if Content-Length specified
             String body = "";
             if (contentLength > 0 && contentLength < 4096) {
-                while (contentLength > 0 && _rtspClient.available()) {
-                    char c = (char)_rtspClient.read();
-                    body += c;
-                    contentLength--;
+                unsigned long tStart = millis();
+                while (contentLength > 0 && (millis() - tStart < 200)) {
+                    if (_rtspClient.available()) {
+                        char c = (char)_rtspClient.read();
+                        body += c;
+                        contentLength--;
+                    } else {
+                        delay(1);
+                    }
                 }
             }
 
